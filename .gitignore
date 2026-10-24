@@ -1,0 +1,9 @@
+# Build outputs
+*.apk
+*.idsig
+
+# Dependencies (installed outside the repo, but just in case)
+node_modules/
+
+# The release APK served by GitHub Pages
+!docs/TermuxStudioCode.apk
