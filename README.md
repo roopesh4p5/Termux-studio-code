@@ -10,7 +10,7 @@ A tablet-first code workspace for Android: a VS Code-style editor that pairs wit
 2. In Termux, run:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/roopesh4p5/Termux-studio-code/main/docs/setup.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/roopesh4p5/Termux-studio-code/dev/docs/setup.sh | bash
    ```
 
    This installs ttyd, git, nodejs and python, sets `allow-external-apps=true`, asks for storage access, and opens the APK installer.

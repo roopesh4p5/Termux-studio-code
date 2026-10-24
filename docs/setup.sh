@@ -1,12 +1,12 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Termux Studio Code — one-shot Termux setup.
-#   curl -fsSL https://raw.githubusercontent.com/roopesh4p5/Termux-studio-code/main/docs/setup.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/roopesh4p5/Termux-studio-code/dev/docs/setup.sh | bash
 #
 # Installs the tools the app uses from Termux (ttyd for the integrated terminal, git,
 # node, python), lets the app run commands in Termux, and downloads + opens the APK.
 set -euo pipefail
 
-APK_URL="https://raw.githubusercontent.com/roopesh4p5/Termux-studio-code/main/docs/TermuxStudioCode.apk"
+APK_URL="https://raw.githubusercontent.com/roopesh4p5/Termux-studio-code/dev/docs/TermuxStudioCode.apk"
 DOWNLOADS="/storage/emulated/0/Download"
 PROPS="$HOME/.termux/termux.properties"
 
