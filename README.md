@@ -15,6 +15,7 @@ A tablet-first code workspace for Android: a VS Code-style editor that pairs wit
 
    This installs ttyd, git, nodejs and python, sets `allow-external-apps=true`, asks for storage access, and opens the APK installer.
 3. Open the app, then allow **All files access** and **Run commands in Termux environment**.
+4. From Termux, run `code .` to open the current folder in the app (or `code file.js` for one file). Projects in Termux's home (`~`) work too, and are much faster than shared storage for npm and git.
 
 Direct APK: [docs/TermuxStudioCode.apk](docs/TermuxStudioCode.apk)
 

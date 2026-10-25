@@ -7,6 +7,8 @@ import { recentProjects } from './settings.js';
 
 let lastDir = null;
 
+const TERMUX_HOME = '/data/data/com.termux/files/home';
+
 function storageRoot() {
   try {
     return sync('platform').externalRoot;
@@ -28,6 +30,7 @@ export const folderPicker = {
       const shortcuts = h('div', { class: 'fp-shortcuts' });
 
       const places = [
+        ['Termux home', TERMUX_HOME],
         ['Internal storage', home],
         ['Download', join(home, 'Download')],
         ['Documents', join(home, 'Documents')],

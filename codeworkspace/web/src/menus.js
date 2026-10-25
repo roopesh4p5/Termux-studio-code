@@ -27,6 +27,8 @@ const MENUS = {
     { cmd: 'reopenClosedTab', label: 'Reopen Closed Editor' },
     { cmd: 'closeTab', label: 'Close Editor' },
     { cmd: 'closeFolder', label: 'Close Folder' },
+    '-',
+    { cmd: 'exit', label: 'Exit' },
   ],
   Edit: () => [
     { cmd: 'editor.undo', label: 'Undo', key: 'Ctrl+Z' },

@@ -3,6 +3,7 @@ package com.roopesh.codeworkspace;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Intent;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
@@ -15,8 +16,6 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
-import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
@@ -87,6 +86,11 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                bridge.closeTerms();
+            }
+
+            @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
                 Uri u = req.getUrl();
                 if (HOST.equals(u.getHost())) return false;
@@ -108,7 +112,23 @@ public class MainActivity extends Activity {
         });
 
         setContentView(webView);
+        handleOpenIntent(getIntent());
         webView.loadUrl(ORIGIN + "index.html");
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (handleOpenIntent(intent)) evalJs("window.__openPath && window.__openPath()");
+    }
+
+    /** "code <path>" from Termux: remember the path until the page asks for it. */
+    private boolean handleOpenIntent(Intent intent) {
+        String path = intent == null ? null : intent.getStringExtra("path");
+        if (path == null || path.isEmpty()) return false;
+        bridge.setPendingOpen(path);
+        return true;
     }
 
     /** Serves bundled assets, plus local image files under /__fs/ for Markdown preview. */
@@ -119,7 +139,12 @@ public class MainActivity extends Activity {
                 String filePath = path.substring("/__fs".length());
                 String mime = mimeFor(filePath);
                 if (mime == null || !mime.startsWith("image/")) return notFound();
-                InputStream in = new FileInputStream(new File(filePath));
+                InputStream in;
+                try {
+                    in = new java.io.ByteArrayInputStream(bridge.readForPreview(filePath));
+                } catch (Exception e) {
+                    return notFound();
+                }
                 return withHeaders(new WebResourceResponse(mime, null, in));
             }
             String asset = "web" + path;

@@ -2,7 +2,7 @@
 # Termux Studio Code — one-shot Termux setup.
 #   curl -fsSL https://raw.githubusercontent.com/roopesh4p5/Termux-studio-code/dev/docs/setup.sh | bash
 #
-# Installs the tools the app uses from Termux (ttyd for the integrated terminal, git,
+# Installs the tools the app uses from Termux (ttyd + tmux for the integrated terminal, git,
 # node, python), lets the app run commands in Termux, and downloads + opens the APK.
 set -euo pipefail
 
@@ -21,8 +21,8 @@ step "Updating packages"
 yes | pkg update -y
 yes | pkg upgrade -y
 
-step "Installing tools (ttyd, git, nodejs, python, openssh, curl)"
-yes | pkg install -y ttyd git nodejs python openssh curl termux-tools
+step "Installing tools (ttyd, tmux, git, nodejs, python, openssh, curl)"
+yes | pkg install -y ttyd tmux git nodejs python openssh curl termux-tools
 
 step "Allowing Termux Studio Code to run commands in Termux"
 mkdir -p "$HOME/.termux"

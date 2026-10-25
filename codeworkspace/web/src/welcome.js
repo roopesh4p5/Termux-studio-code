@@ -71,7 +71,7 @@ export const welcome = {
           ...SHORTCUTS.map(([l, k]) => h('div', { class: 'key-row' }, h('span', {}, l), h('kbd', {}, k))),
         ),
       ),
-      h('div', { class: 'welcome-footer muted' }, 'Termux Studio Code v0.2.1 · Developed by Roopesh'),
+      h('div', { class: 'welcome-footer muted' }, 'Termux Studio Code v0.3.0 · Developed by Roopesh'),
     );
   },
 };

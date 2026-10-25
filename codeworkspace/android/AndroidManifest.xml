@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.roopesh.codeworkspace"
-    android:versionCode="3"
-    android:versionName="0.2.1">
+    android:versionCode="5"
+    android:versionName="0.3.0">
 
     <uses-sdk android:minSdkVersion="27" android:targetSdkVersion="34" />
 
@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <queries>
         <package android:name="com.termux" />
@@ -23,7 +25,8 @@
         android:theme="@style/AppTheme"
         android:requestLegacyExternalStorage="true"
         android:hardwareAccelerated="true"
-        android:allowBackup="false">
+        android:allowBackup="false"
+        android:networkSecurityConfig="@xml/network_security_config">
 
         <activity
             android:name=".SplashActivity"
@@ -38,9 +41,24 @@
 
         <activity
             android:name=".MainActivity"
-            android:exported="false"
+            android:exported="true"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density" />
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density">
+            <!-- "code <path>" in Termux (termux/code.sh) -->
+            <intent-filter>
+                <action android:name="com.roopesh.codeworkspace.OPEN" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".TermService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps integrated terminal connections to Termux alive" />
+        </service>
     </application>
 </manifest>

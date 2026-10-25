@@ -38,6 +38,9 @@ cp -r "$ROOT/web/src" "$OUT/websrc"
   --outdir=assets/web --chunk-names='chunks/[name]-[hash]' \
   --legal-comments=none --log-level=warning --metafile=meta.json)
 cp "$ROOT/web/index.html" "$OUT/assets/web/"
+# Files the app installs into Termux (file agent, "code" command).
+mkdir -p "$OUT/assets/termux"
+cp "$ROOT/termux/agent.js" "$ROOT/termux/code.sh" "$OUT/assets/termux/"
 du -sh "$OUT/assets/web"
 
 step "Compiling resources"

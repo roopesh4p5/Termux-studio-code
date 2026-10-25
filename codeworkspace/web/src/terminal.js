@@ -34,6 +34,12 @@ const sessions = [];
 let active = null;
 let seq = 0;
 let starting = null;
+let restored = false;
+let keepAlive = false;
+let lastInputAt = 0;
+
+const STORE_KEY = 'terminals';
+const newTmuxName = () => 'tsc-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
 // ---------------------------------------------------------------- server
 
@@ -44,7 +50,9 @@ async function getConfig() {
 
 // The WebView may not connect to localhost itself (Local Network Access rules), so the
 // WebSocket to ttyd lives in Java (TermSocket.java) and events come back via window.__term.
+// Ids are unique per page load so events from a socket opened before a reload can't reach a new one.
 const sockets = new Map();
+const pageId = Math.random().toString(36).slice(2, 8);
 let socketSeq = 0;
 
 window.__term = (id, event, data) => {
@@ -69,7 +77,7 @@ window.__term = (id, event, data) => {
 
 class NativeSocket {
   constructor(port, path) {
-    this.id = 't' + ++socketSeq;
+    this.id = `t${pageId}-${++socketSeq}`;
     this.readyState = 0;
     sockets.set(this.id, this);
     window.Native.termOpen(this.id, port, path);
@@ -85,9 +93,11 @@ class NativeSocket {
   }
 }
 
-function openSocket(cfg, cwd) {
+/** args become the shell's $1.. in ttyd (see Bridge.terminalStart): [cwd, tmuxSession, mode]. */
+function openSocket(cfg, args) {
   return new Promise((resolve, reject) => {
-    const ws = new NativeSocket(cfg.port, `/${cfg.token}/ws?arg=${encodeURIComponent(cwd)}`);
+    const query = args.map((a) => 'arg=' + encodeURIComponent(a)).join('&');
+    const ws = new NativeSocket(cfg.port, `/${cfg.token}/ws?${query}`);
     let settled = false;
     const fail = (msg) => {
       if (settled) return;
@@ -129,11 +139,11 @@ async function startServer(onStatus) {
   }
 }
 
-async function connect(cwd, onStatus) {
+async function connect(args, onStatus) {
   const cfg = await getConfig();
   let lastError = '';
   try {
-    return await openSocket(cfg, cwd);
+    return await openSocket(cfg, args);
   } catch (e) {
     lastError = e.message; // not running yet
   }
@@ -141,7 +151,7 @@ async function connect(cwd, onStatus) {
   for (let i = 0; i < 30; i++) {
     await sleep(i < 5 ? 300 : 500);
     try {
-      return await openSocket(cfg, cwd);
+      return await openSocket(cfg, args);
     } catch (e) {
       lastError = e.message;
     }
@@ -155,14 +165,29 @@ async function connect(cwd, onStatus) {
 // --------------------------------------------------------------- session
 
 class Session {
-  constructor(cwd, command) {
+  /** Pass `tmux` to reattach to a shell that is still running from an earlier app run. */
+  constructor(cwd, command, tmux = null, name = null) {
     this.id = ++seq;
     this.cwd = cwd;
     this.command = command;
-    this.name = command ? command.split(' ').slice(0, 3).join(' ') : basename(cwd) || 'bash';
+    this.name = name || (command ? command.split(' ').slice(0, 3).join(' ') : basename(cwd) || 'bash');
     this.el = h('div', { class: 'term-instance' });
+    // Capture phase, so xterm's own right-click handling can't clear the selection first.
+    this.el.addEventListener(
+      'contextmenu',
+      (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.showMenu(e.clientX, e.clientY);
+      },
+      true,
+    );
     this.ws = null;
     this.exited = false;
+    this.lost = false; // could not reach the server; Enter or returning to the app retries
+    this.gone = false; // the server reported the tmux session no longer exists
+    this.tmux = tmux ?? newTmuxName();
+    this.reattach = !!tmux;
     this.initTerm();
   }
 
@@ -181,12 +206,28 @@ class Session {
     this.term.loadAddon(this.fit);
     this.term.loadAddon(new WebLinksAddon((e, uri) => call('app.openUrl', { url: uri })));
     this.term.attachCustomKeyEventHandler((e) => this.onKey(e));
-    this.term.onData((d) => this.send('0' + d));
+    this.term.onData((d) => {
+      lastInputAt = Date.now();
+      if (d.includes('\r')) this.lastEnter = lastInputAt;
+      this.send('0' + d);
+    });
     this.term.onResize(({ cols, rows }) => this.send('1' + JSON.stringify({ columns: cols, rows })));
     this.term.onTitleChange((title) => this.onTitle(title));
+    // Sent by the server when a reattach finds the tmux session gone (the shell exited).
+    this.term.parser.registerOscHandler(7770, () => {
+      this.gone = true;
+      return true;
+    });
+    // "code <path>" typed in this terminal (termux/code.sh).
+    this.term.parser.registerOscHandler(7771, (path) => {
+      if (path.startsWith('/')) app.openPath(path);
+      return true;
+    });
     // After the shell exits, Enter starts a fresh one in the same terminal.
     this.term.onKey(({ domEvent }) => {
-      if (this.exited && domEvent.key === 'Enter') this.restart();
+      if (!this.exited || domEvent.key !== 'Enter') return;
+      if (this.lost) this.reconnect();
+      else this.restart();
     });
   }
 
@@ -214,28 +255,106 @@ class Session {
   async start() {
     this.term.open(this.el);
     this.fitNow();
-    this.term.write('\x1b[90mConnecting to Termux…\x1b[0m');
+    await this.attach(this.reattach);
+  }
+
+  /**
+   * Connects to the server. The shell runs in a tmux session, so with `existing` this
+   * reattaches to it (tmux redraws the screen) instead of starting a new shell.
+   */
+  async attach(existing) {
+    this.gone = false;
+    this.term.write(existing ? '\x1b[90mReconnecting…\x1b[0m' : '\x1b[90mConnecting to Termux…\x1b[0m');
+    let ws;
     try {
-      this.ws = await connect(this.cwd, (msg) => this.term.write(`\r\x1b[2K\x1b[90m${msg}\x1b[0m`));
+      ws = await connect([this.cwd, this.tmux, existing ? 'attach' : 'new'], (msg) =>
+        this.term.write(`\r\x1b[2K\x1b[90m${msg}\x1b[0m`),
+      );
     } catch (e) {
       this.term.write(`\r\x1b[2K\x1b[31m${e.message}\x1b[0m\r\n`);
+      if (existing) this.term.write('\x1b[90m[Press Enter to reconnect]\x1b[0m\r\n');
       this.exited = true;
+      this.lost = existing;
       if (e.code === 'PERMISSION') toast(e.message, { type: 'warn', timeout: 8000 });
+      renderTabs();
       return;
     }
+    if (this.disposed) return ws.close();
+    this.ws = ws;
+    this.exited = false;
+    this.lost = false;
+    this.openedAt = Date.now();
     this.term.write('\r\x1b[2K');
-    const ws = this.ws;
     // Terminal output bytes (Java strips ttyd's message-type byte and ignores other messages;
     // the shell's own title escapes arrive in the output and surface via onTitleChange).
-    ws.onmessage = (bytes) => this.term.write(bytes);
-    ws.onclose = () => {
-      if (this.exited) return;
-      this.exited = true;
-      this.term.write('\r\n\x1b[90m[Process exited — press Enter to restart]\x1b[0m\r\n');
-      renderTabs();
+    ws.onmessage = (bytes) => {
+      this.term.write(bytes);
+      this.outputSettled();
     };
+    ws.onclose = () => this.onClose(ws);
     ws.send(JSON.stringify({ AuthToken: '', columns: this.term.cols, rows: this.term.rows }));
-    if (this.command) setTimeout(() => this.send('0' + this.command + '\r'), 250);
+    if (this.command && !existing) setTimeout(() => this.send('0' + this.command + '\r'), 250);
+    renderTabs();
+  }
+
+  /**
+   * Once a command's output goes quiet, let the workspace pick up files it changed — once per
+   * Enter, so the echo of the next command being typed doesn't trigger syncs.
+   */
+  outputSettled() {
+    if (!this.lastEnter) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      this.lastEnter = 0;
+      bus.emit('terminal-idle');
+    }, 1000);
+  }
+
+  /** Right-click (mouse) or long-press (touch) menu; the selection is read before it can change. */
+  showMenu(x, y) {
+    const sel = this.term.getSelection();
+    contextMenu(x, y, [
+      {
+        label: 'Copy',
+        icon: 'copy',
+        disabled: !sel,
+        run: () => {
+          app.copy(sel);
+          this.term.clearSelection();
+        },
+      },
+      { label: 'Paste', run: () => call('clipboard.get').then((t) => t && this.term.paste(t)) },
+      { label: 'Select All', run: () => this.term.selectAll() },
+      '-',
+      { label: 'Clear', run: () => this.term.clear() },
+      { label: 'Kill Terminal', icon: 'trash', run: () => kill(this) },
+    ]);
+  }
+
+  /** A dropped connection (app frozen in the background, ttyd restarted…) reattaches to the shell. */
+  onClose(ws) {
+    if (ws !== this.ws || this.exited) return;
+    this.ws = null;
+    // Closing straight after a reattach means the session is not coming back.
+    const flapping = this.reattachedAt && Date.now() - this.openedAt < 2000;
+    if (this.gone || flapping) {
+      this.exited = true;
+      this.term.write('\r\x1b[2K\r\n\x1b[90m[Process exited — press Enter to restart]\x1b[0m\r\n');
+      renderTabs();
+      return;
+    }
+    this.reconnect();
+  }
+
+  async reconnect() {
+    if (this.reconnecting || this.disposed) return;
+    this.reconnecting = true;
+    this.reattachedAt = Date.now();
+    try {
+      await this.attach(true);
+    } finally {
+      this.reconnecting = false;
+    }
   }
 
   async restart() {
@@ -247,6 +366,12 @@ class Session {
     }
     this.ws = null;
     this.command = null;
+    killTmux(this.tmux);
+    this.tmux = newTmuxName();
+    this.reattach = false;
+    this.reattachedAt = 0;
+    this.lost = false;
+    saveSessions();
     this.term.dispose();
     this.el.innerHTML = '';
     this.initTerm();
@@ -278,14 +403,65 @@ class Session {
 
   dispose() {
     this.exited = true;
+    this.disposed = true;
     try {
       this.ws?.close();
     } catch {
       /* ignore */
     }
+    killTmux(this.tmux);
     this.term.dispose();
     this.el.remove();
   }
+}
+
+/** Remembered so the panel (and its terminals) come back after a reload or app restart. */
+function setOpen(on) {
+  if (!!settings.terminalOpen !== on) updateSettings({ terminalOpen: on });
+}
+
+function killTmux(name) {
+  call('terminal.kill', { name }).catch(() => {});
+}
+
+/**
+ * Remembers open terminals so a restarted app reattaches to their shells, and keeps the
+ * foreground service (TermService) running while any terminal is open.
+ */
+function saveSessions() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(sessions.map((s) => ({ tmux: s.tmux, cwd: s.cwd, name: s.name }))));
+  } catch {
+    /* storage unavailable */
+  }
+  const on = sessions.length > 0;
+  if (on !== keepAlive) {
+    keepAlive = on;
+    call('terminal.keepAlive', { on }).catch(() => {});
+  }
+}
+
+/** Reattaches the terminals from the previous app run, once. */
+function restoreSessions() {
+  if (restored) return;
+  restored = true;
+  let saved = [];
+  try {
+    saved = JSON.parse(localStorage.getItem(STORE_KEY) ?? '[]');
+  } catch {
+    /* ignore */
+  }
+  for (const { tmux, cwd, name } of saved) {
+    if (!tmux || !cwd) continue;
+    const s = new Session(cwd, null, tmux, name);
+    sessions.push(s);
+    els.body.append(s.el);
+    s.el.hidden = true;
+  }
+  if (!sessions.length) return;
+  activate(sessions[0]);
+  for (const s of sessions) s.start().then(() => s.fitNow());
+  saveSessions();
 }
 
 // ------------------------------------------------------------------ panel
@@ -339,6 +515,7 @@ function kill(s) {
   if (i < 0) return;
   sessions.splice(i, 1);
   s.dispose();
+  saveSessions();
   if (active === s) active = null;
   if (sessions.length) activate(sessions[Math.min(i, sessions.length - 1)]);
   else terminal.hide();
@@ -423,14 +600,17 @@ export const terminal = {
   },
 
   show() {
+    setOpen(true);
     els.panel.hidden = false;
     els.handle.hidden = false;
     setHeight(settings.panelHeight ?? 260);
+    restoreSessions();
     if (!sessions.length) return terminal.create();
     activate(active ?? sessions[0]);
   },
 
   hide() {
+    setOpen(false);
     els.panel.hidden = true;
     els.handle.hidden = true;
     els.panel.classList.remove('maximized');
@@ -452,11 +632,14 @@ export const terminal = {
   /** Opens a new terminal in the project folder, optionally running a command. */
   async create(command) {
     const cwd = app.workspace.root ?? '/storage/emulated/0';
+    setOpen(true);
     els.panel.hidden = false;
     els.handle.hidden = false;
     setHeight(settings.panelHeight ?? 260);
+    restoreSessions();
     const s = new Session(cwd, command);
     sessions.push(s);
+    saveSessions();
     els.body.append(s.el);
     activate(s);
     await s.start();
@@ -490,6 +673,27 @@ export const terminal = {
         terminal.create(it.command);
       },
     });
+  },
+
+  /**
+   * True while the user is typing in a terminal. Workspace syncs wait for a pause: git status
+   * makes thousands of bridge calls, which would hold up the echo of every keystroke.
+   */
+  typing() {
+    return Date.now() - lastInputAt < 2000;
+  },
+
+  /** Back in the app: retry terminals whose server could not be reached. */
+  resume() {
+    for (const s of sessions) if (s.lost && s.exited) s.reconnect();
+  },
+
+  /** File > Exit ends every shell, so nothing should be reattached next launch. */
+  forgetAll() {
+    restored = true;
+    sessions.length = 0;
+    saveSessions();
+    setOpen(false);
   },
 
   focused() {

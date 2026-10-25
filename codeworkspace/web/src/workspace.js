@@ -38,6 +38,7 @@ export const workspace = {
     bus.emit('workspace', this);
     await app.explorer.load(path, state.expanded ?? []);
     await app.editor.restore(state.editor);
+    this.gitSig = await this.gitSignature();
     await this.detectRepo();
   },
 
@@ -52,9 +53,78 @@ export const workspace = {
     this.changes = [];
     this.gitMap = {};
     this.gitDirs = new Set();
+    this.fileList = null;
+    this.gitSig = '';
+    git.resetCache();
     setLastProject(null);
     bus.emit('workspace', this);
     bus.emit('git-status', this);
+  },
+
+  /**
+   * Re-reads everything that can change behind the app's back (commands in the terminal or
+   * Termux, other apps): the explorer tree, open editors, the repository and its status.
+   */
+  async sync() {
+    if (!this.root) return;
+    if (app.terminal?.typing()) {
+      clearTimeout(this.syncDeferred);
+      this.syncDeferred = setTimeout(() => this.sync(), 2000);
+      return;
+    }
+    if (this.syncing) {
+      this.syncPending = true;
+      return;
+    }
+    this.syncing = true;
+    try {
+      git.resetCache();
+      this.fileList = null;
+      await Promise.all([app.explorer.refresh(), app.editor.checkAllExternal()]);
+      this.gitSig = await this.gitSignature();
+      await this.detectRepo();
+    } finally {
+      this.syncing = false;
+    }
+    if (this.syncPending) {
+      this.syncPending = false;
+      this.sync();
+    }
+  },
+
+  /**
+   * Cheap periodic check: re-lists expanded folders, stats open files and a few files in
+   * .git, and only does the expensive git status when something actually changed.
+   */
+  async poll() {
+    if (!this.root || this.syncing || this.polling || app.terminal?.typing()) return;
+    this.polling = true;
+    try {
+      const root = this.root;
+      const treeChanged = await app.explorer.refresh();
+      if (treeChanged) this.fileList = null;
+      await app.editor.checkAllExternal();
+      const sig = await this.gitSignature();
+      if (root !== this.root) return;
+      if (sig !== this.gitSig || treeChanged) {
+        this.gitSig = sig;
+        git.resetCache();
+        await this.detectRepo();
+      }
+    } catch (e) {
+      console.warn('workspace poll failed', e);
+    } finally {
+      this.polling = false;
+    }
+  },
+
+  /** Changes whenever a repo appears/disappears, HEAD moves, the index is written or a fetch runs. */
+  async gitSignature() {
+    const repo = this.root ? await git.findRoot(this.root) : null;
+    if (!repo) return '';
+    const files = ['HEAD', 'index', 'FETCH_HEAD', 'logs/HEAD'];
+    const times = await Promise.all(files.map((f) => fs.stat(join(repo, '.git', f)).then((s) => s.mtimeMs, () => 0)));
+    return repo + ':' + times.join(',');
   },
 
   persist() {

@@ -1,5 +1,6 @@
 // Command registry, keyboard shortcuts, command palette, quick open, go to line/symbol, settings.
 import { app } from './app.js';
+import { call } from './native.js';
 import { h, quickPick, fuzzy, hasOverlay, dialog, toast } from './ui.js';
 import { icon, fileBadge } from './icons.js';
 import { basename, dirname, join, relative } from './path.js';
@@ -108,6 +109,12 @@ export function registerCommands() {
   def('settings', 'Preferences: Open Settings', openSettings, ['Ctrl+,']);
   def('shortcuts', 'Help: Keyboard Shortcuts', showShortcuts, ['Ctrl+K']);
   def('about', 'Help: About', showAbout);
+  def('exit', 'File: Exit', exitApp);
+  def('reloadWindow', 'Developer: Reload Window', reloadWindow);
+  def('syncWorkspace', 'Developer: Sync Workspace with Disk', needsFolder(async () => {
+    await app.workspace.sync();
+    toast('Workspace synced with disk');
+  }));
 
   window.addEventListener('keydown', onKeyDown, true);
 }
@@ -283,6 +290,44 @@ export function quickOpen(prefix = '') {
   });
 }
 
+/** Asks what to do with unsaved files before the page goes away; false means cancel. */
+async function settleUnsaved(title, action) {
+  const dirty = ed().dirtyTabs();
+  if (dirty.length) {
+    const r = await dialog({
+      title,
+      body: h('div', { class: 'dialog-message' }, `${dirty.length} file${dirty.length > 1 ? 's have' : ' has'} unsaved changes.`),
+      buttons: [
+        { label: 'Cancel', value: false },
+        { label: "Don't Save", value: 'discard' },
+        { label: `Save All & ${action}`, value: 'save', primary: true },
+      ],
+    });
+    if (!r) return false;
+    if (r === 'save') await ed().saveAll();
+  }
+  app.workspace.persist();
+  return true;
+}
+
+/** Closes the app completely, ending its terminal sessions and the server in Termux. */
+async function exitApp() {
+  if (!(await settleUnsaved('Exit', 'Exit'))) return;
+  app.terminal.forgetAll();
+  await call('app.exit');
+}
+
+/** Reloads the whole UI from scratch; the project, editors and terminals (via tmux) come back. */
+async function reloadWindow() {
+  if (!(await settleUnsaved('Reload Window', 'Reload'))) return;
+  try {
+    sessionStorage.setItem('reloading', '1');
+  } catch {
+    /* the project then reopens only if "reopen last project" is on */
+  }
+  location.reload();
+}
+
 function openRecent() {
   quickPick({
     placeholder: 'Open recent folder',
@@ -382,7 +427,7 @@ function showAbout() {
       { class: 'about' },
       h('div', { class: 'welcome-logo' }, '</>'),
       h('h2', {}, 'Termux Studio Code'),
-      h('div', { class: 'muted' }, 'Version 0.2.1'),
+      h('div', { class: 'muted' }, 'Version 0.3.0'),
       h('p', {}, 'A lightweight, tablet-first code workspace for browsing, editing, searching, formatting and managing Git repositories — with optional Termux integration.'),
       h('p', { class: 'about-dev' }, 'Developed by Roopesh'),
       h('div', { class: 'muted small' }, 'Built with CodeMirror, isomorphic-git, Prettier and marked.'),

@@ -2,7 +2,8 @@
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
 import { app, bus } from './app.js';
-import { hasNative, sync, call } from './native.js';
+import { hasNative, sync, call, fs } from './native.js';
+import { dirname, isInside } from './path.js';
 import { h, toast, closeTopOverlay, contextMenu, iconButton } from './ui.js';
 import { icon } from './icons.js';
 import { settings, updateSettings, lastProject } from './settings.js';
@@ -18,12 +19,12 @@ import { termux } from './termux.js';
 import { welcome } from './welcome.js';
 import { terminal } from './terminal.js';
 import { registerCommands, run, shortcutFor } from './commands.js';
-import * as git from './git.js';
 import { MENU_NAMES, openMenu, openAllMenus } from './menus.js';
 
 Object.assign(app, {
   editor, workspace, explorer, search: searchView, scm, diffView, markdown, folderPicker, termux, welcome, terminal,
   commands: { run },
+  openPath: (path) => openPath(path),
   copy(text) {
     call('clipboard.set', { text }).then(() => toast('Copied to clipboard'));
   },
@@ -266,7 +267,18 @@ function showStorageGate() {
 
 async function startWorkspace() {
   const last = lastProject();
-  if (settings.reopenLastProject && last) {
+  let reloading = false;
+  try {
+    reloading = sessionStorage.getItem('reloading') === '1';
+    sessionStorage.removeItem('reloading');
+  } catch {
+    /* ignore */
+  }
+  call('termux.bootstrap').catch(() => {});
+  const requested = await call('app.takePendingOpen').catch(() => null);
+  if (requested) {
+    await openPath(requested);
+  } else if ((settings.reopenLastProject || reloading) && last) {
     try {
       await workspace.open(last);
     } catch (e) {
@@ -274,7 +286,29 @@ async function startWorkspace() {
       toast(`Could not reopen ${last}`, { type: 'warn' });
     }
   }
+  if (settings.terminalOpen) terminal.show();
 }
+
+/** Opens a folder as the workspace, or a file (with its folder, unless it is in the open one). */
+async function openPath(path) {
+  try {
+    const st = await fs.stat(path);
+    if (st.isDir) {
+      await workspace.open(path);
+    } else {
+      if (!workspace.root || !isInside(workspace.root, path)) await workspace.open(dirname(path));
+      await editor.openFile(path);
+    }
+  } catch (e) {
+    toast(`Could not open ${path}: ${e.message}`, { type: 'error', timeout: 8000 });
+  }
+}
+
+// "code <path>" from Termux while the app is already running.
+window.__openPath = async () => {
+  const path = await call('app.takePendingOpen').catch(() => null);
+  if (path) await openPath(path);
+};
 
 // --------------------------------------------------------- lifecycle hooks
 
@@ -301,12 +335,8 @@ window.__onResume = async () => {
     }
     return;
   }
-  if (!workspace.root) return;
-  git.resetCache();
-  workspace.fileList = null;
-  await editor.checkAllExternal();
-  explorer.refresh();
-  workspace.refreshGit();
+  terminal.resume();
+  await workspace.sync();
 };
 
 let persistTimer = null;
@@ -345,6 +375,12 @@ function boot() {
     gitTimer = setTimeout(() => workspace.refreshGit(), 1200);
   });
   bus.on('tabs-changed', schedulePersist);
+  // Commands run in the terminal change files behind the app's back: sync once their output
+  // settles, and poll cheaply in case anything else (Termux, other apps) changes the project.
+  bus.on('terminal-idle', () => workspace.sync());
+  setInterval(() => {
+    if (!document.hidden) workspace.poll();
+  }, 3000);
   bus.on('settings', renderStatus);
   bus.on('nav-state', (n) => {
     els.back.classList.toggle('dim', !n.back);

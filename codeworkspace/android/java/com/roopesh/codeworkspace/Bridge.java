@@ -52,21 +52,42 @@ public class Bridge {
     static final int REQ_TERMUX = 2;
     static final String TERMUX_PKG = "com.termux";
     static final String TERMUX_PREFIX = "/data/data/com.termux/files/usr";
+    static final String TERMUX_HOME = "/data/data/com.termux/files/home";
     static final long MAX_TEXT_BYTES = 8L * 1024 * 1024;
 
     private final MainActivity activity;
     private final WebView webView;
     private final ExecutorService pool = Executors.newFixedThreadPool(4);
     private final SearchOps search = new SearchOps();
+    private final TermuxAgent agent;
+    private volatile String pendingOpen;
 
     Bridge(MainActivity activity, WebView webView) {
         this.activity = activity;
         this.webView = webView;
+        this.agent = new TermuxAgent(token(), this::agentStart);
+    }
+
+    /** A folder or file to open, from "code <path>" in Termux; JS collects it via app.takePendingOpen. */
+    void setPendingOpen(String path) {
+        pendingOpen = path;
+    }
+
+    /** Reads a file for the Markdown preview's image requests, through the agent for Termux paths. */
+    byte[] readForPreview(String path) throws Exception {
+        if (TermuxAgent.isTermuxPath(path)) return Base64.decode((String) agent.call("fs.readB64", new JSONObject().put("path", path)), Base64.NO_WRAP);
+        return readBytes(file(path));
     }
 
     void shutdown() {
-        for (TermSocket t : terms.values()) t.close();
+        closeTerms();
         pool.shutdownNow();
+    }
+
+    /** Drops every terminal connection, e.g. when the page reloads (shells live on in tmux). */
+    void closeTerms() {
+        for (TermSocket t : terms.values()) t.close();
+        terms.clear();
     }
 
     static class BridgeException extends Exception {
@@ -153,6 +174,17 @@ public class Bridge {
     }
 
     private Object dispatch(String op, JSONObject a) throws Exception {
+        if (op.equals("search.cancel")) {
+            search.cancel();
+            agent.cancelSearch();
+            return null;
+        }
+        if (op.startsWith("fs.") || op.startsWith("search.")) {
+            boolean termux = TermuxAgent.isTermuxPath(a.optString("path", a.optString("root", a.optString("from", ""))));
+            if (a.has("to") && TermuxAgent.isTermuxPath(a.getString("to")) != termux)
+                throw new BridgeException("EXDEV", "Cannot move or copy between Termux storage and shared storage");
+            if (termux) return agent.call(op, a);
+        }
         switch (op) {
             // ---- platform ----
             case "platform": return platform();
@@ -199,7 +231,6 @@ public class Bridge {
                     a.optInt("max", 50000));
             case "search.text": return search.searchText(a);
             case "search.replace": return search.replaceText(a);
-            case "search.cancel": search.cancel(); return null;
 
             // ---- network (used by git) ----
             case "http.request": return http(a);
@@ -209,6 +240,15 @@ public class Bridge {
             case "termux.run": return termuxRun(a.getString("cwd"), a.optString("command", ""));
             case "terminal.config": return terminalConfig();
             case "terminal.start": return terminalStart();
+            case "terminal.kill": return terminalKill(a.getString("name"));
+            case "terminal.keepAlive": TermService.setActive(activity, a.getBoolean("on")); return null;
+            case "app.exit": return exitApp();
+            case "app.takePendingOpen": {
+                String p = pendingOpen;
+                pendingOpen = null;
+                return p;
+            }
+            case "termux.bootstrap": return termuxBootstrap();
             case "clipboard.get": return getClipboard();
             default:
                 throw new BridgeException("ENOSYS", "Unknown operation: " + op);
@@ -224,6 +264,7 @@ public class Bridge {
         o.put("storageGranted", storageGranted());
         o.put("externalRoot", Environment.getExternalStorageDirectory().getAbsolutePath());
         o.put("termuxInstalled", termuxInstalled());
+        o.put("termuxHome", TERMUX_HOME);
         return o;
     }
 
@@ -489,40 +530,141 @@ public class Bridge {
 
     /** Port + secret path for the ttyd terminal server. The token is generated once per install. */
     private JSONObject terminalConfig() throws JSONException {
+        JSONObject o = new JSONObject();
+        o.put("port", TERMINAL_PORT);
+        o.put("token", token());
+        return o;
+    }
+
+    /** Secret shared by the ttyd server and the file agent; generated once per install. */
+    private String token() {
         SharedPreferences p = prefs();
         String token = p.getString("terminal-token", null);
         if (token == null) {
             byte[] raw = new byte[24];
             new java.security.SecureRandom().nextBytes(raw);
             token = Base64.encodeToString(raw, Base64.NO_WRAP | Base64.URL_SAFE | Base64.NO_PADDING);
-            p.edit().putString("terminal-token", token).apply();
+            p.edit().putString("terminal-token", token).commit();
         }
-        JSONObject o = new JSONObject();
-        o.put("port", TERMINAL_PORT);
-        o.put("token", token);
-        return o;
+        return token;
     }
+
+    static final String TMUX = "tmux -L termux-studio -f $HOME/.termux-studio/tmux.conf";
+    static final String TTYD_PATTERN = "^ttyd -i 127[.]0[.]0[.]1 -p " + TERMINAL_PORT;
 
     /**
      * Starts (or restarts) ttyd inside Termux as a background task, bound to localhost and
-     * reachable only under the secret base path. Each WebSocket connection gets its own
-     * login shell in the directory passed as ?arg=. Returns "ok" or "permission".
+     * reachable only under the secret base path. Each WebSocket connection runs a shell in the
+     * directory passed as the first ?arg=. When tmux is available the shell lives in the tmux
+     * session named by the second arg, so it survives dropped connections; a third arg of
+     * "attach" only reattaches, printing OSC 7770 when that session no longer exists.
+     * Returns "ok" or "permission".
      */
     private String terminalStart() throws Exception {
+        String token = token();
+        String shell = "cd \"${1:-$HOME}\" 2>/dev/null; export TERMUX_HUSHLOGIN=1 TERMUX_STUDIO=1; T=\"" + TMUX + "\"; "
+                + "if [ \"$3\" = attach ]; then "
+                + "{ command -v tmux >/dev/null && $T has-session -t \"=$2\" 2>/dev/null && exec $T attach-session -t \"=$2\"; }; "
+                + "printf \"\\033]7770;gone\\007\"; sleep 0.3; exit 0; fi; "
+                + "if [ -n \"$2\" ] && command -v tmux >/dev/null; then exec $T new-session -A -s \"$2\"; fi; "
+                + "exec " + TERMUX_PREFIX + "/bin/login";
+        String script =
+                "command -v ttyd >/dev/null 2>&1 || yes | pkg install -y ttyd >/dev/null 2>&1\n"
+                + "command -v tmux >/dev/null 2>&1 || yes | pkg install -y tmux >/dev/null 2>&1\n"
+                + bootstrapScript()
+                + "pkill -f '" + TTYD_PATTERN + "' 2>/dev/null\n"
+                + "sleep 0.2\n"
+                + "exec ttyd -i 127.0.0.1 -p " + TERMINAL_PORT + " -W -a -b /" + token
+                + " -t disableLeaveAlert=true bash -c '" + shell + "' termux-studio";
+        return runInBackground(script);
+    }
+
+    static final String AGENT_PATTERN = "termux-studio/agent[.]js";
+
+    /**
+     * Files the app keeps in Termux: the file agent, the "code" command and the tmux config.
+     * Rewritten on every start so they match this app version. An existing "code" that is not
+     * ours (e.g. code-server) is left alone.
+     */
+    private String bootstrapScript() throws IOException {
+        String agentJs = Base64.encodeToString(readAsset("termux/agent.js"), Base64.NO_WRAP);
+        String codeSh = Base64.encodeToString(readAsset("termux/code.sh"), Base64.NO_WRAP);
+        String code = TERMUX_PREFIX + "/bin/code";
+        return "mkdir -p ~/.termux-studio\n"
+                + "printf %s " + agentJs + " | base64 -d > ~/.termux-studio/agent.js\n"
+                + "if [ ! -e " + code + " ] || grep -q 'Termux Studio Code' " + code + "; then "
+                + "printf %s " + codeSh + " | base64 -d > " + code + " && chmod 755 " + code + "; fi\n"
+                + "cat > ~/.termux-studio/tmux.conf <<'EOF'\n"
+                + "set -g status off\n"
+                // No alternate screen: output scrolls into xterm.js's own scrollback, so touch
+                // scrolling and text selection work as without tmux.
+                + "set -ga terminal-overrides ',xterm*:smcup@:rmcup@'\n"
+                + "set -s escape-time 0\n"
+                + "set -g set-titles on\n"
+                + "set -g set-titles-string '#{pane_current_path}'\n"
+                // Lets "code ." inside the integrated terminal reach the app (OSC 7771).
+                + "set -g allow-passthrough on\n"
+                + "set-environment -g TERMUX_STUDIO 1\n"
+                + "EOF\n"
+                + TMUX + " source-file ~/.termux-studio/tmux.conf 2>/dev/null\n";
+    }
+
+    private byte[] readAsset(String name) throws IOException {
+        try (InputStream in = activity.getAssets().open(name)) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            return bos.toByteArray();
+        }
+    }
+
+    /** Starts (or restarts) the file agent in Termux. Returns "ok" or "permission". */
+    private String agentStart() throws Exception {
+        return runInBackground(bootstrapScript()
+                + "command -v node >/dev/null 2>&1 || yes | pkg install -y nodejs >/dev/null 2>&1\n"
+                + "pkill -f '" + AGENT_PATTERN + "' 2>/dev/null\n"
+                + "exec node ~/.termux-studio/agent.js " + TermuxAgent.PORT + " " + token());
+    }
+
+    /** Keeps the "code" command and config in Termux current, without asking for permission. */
+    private String termuxBootstrap() throws Exception {
+        if (!termuxInstalled() || activity.checkSelfPermission("com.termux.permission.RUN_COMMAND") != PackageManager.PERMISSION_GRANTED)
+            return "skipped";
+        return runInBackground(bootstrapScript());
+    }
+
+    /** Ends a terminal's tmux session (the shell and everything running in it). */
+    private String terminalKill(String name) throws Exception {
+        if (!name.matches("[A-Za-z0-9_-]+")) throw new BridgeException("EINVAL", "Bad session name");
+        return runInBackground(TMUX + " kill-session -t =" + name + " 2>/dev/null");
+    }
+
+    /** File > Exit: stops the terminal server and all its sessions, then ends the app process. */
+    private String exitApp() {
+        try {
+            if (termuxInstalled()) {
+                runInBackground(TMUX + " kill-server 2>/dev/null; pkill -f '" + TTYD_PATTERN + "' 2>/dev/null; pkill -f '" + AGENT_PATTERN + "' 2>/dev/null");
+            }
+        } catch (Exception e) {
+            Log.w(MainActivity.TAG, "could not stop terminal server", e);
+        }
+        TermService.setActive(activity, false);
+        activity.runOnUiThread(() -> {
+            activity.finishAndRemoveTask();
+            webView.postDelayed(() -> android.os.Process.killProcess(android.os.Process.myPid()), 500);
+        });
+        return "ok";
+    }
+
+    /** Runs a bash script as a Termux background task. Returns "ok" or "permission". */
+    private String runInBackground(String script) throws Exception {
         if (!termuxInstalled()) throw new BridgeException("ENOTERMUX", "Termux is not installed");
         if (activity.checkSelfPermission("com.termux.permission.RUN_COMMAND") != PackageManager.PERMISSION_GRANTED) {
             activity.runOnUiThread(() -> activity.requestPermissions(
                     new String[]{"com.termux.permission.RUN_COMMAND"}, REQ_TERMUX));
             return "permission";
         }
-        String token = terminalConfig().getString("token");
-        String shell = "cd \"${1:-$HOME}\" 2>/dev/null; export TERMUX_HUSHLOGIN=1; exec " + TERMUX_PREFIX + "/bin/login";
-        String script =
-                "command -v ttyd >/dev/null 2>&1 || yes | pkg install -y ttyd >/dev/null 2>&1\n"
-                + "pkill -f '^ttyd -i 127[.]0[.]0[.]1 -p " + TERMINAL_PORT + "' 2>/dev/null\n"
-                + "sleep 0.2\n"
-                + "exec ttyd -i 127.0.0.1 -p " + TERMINAL_PORT + " -W -a -b /" + token
-                + " -t disableLeaveAlert=true bash -c '" + shell + "' termux-studio";
         Intent i = new Intent();
         i.setClassName(TERMUX_PKG, "com.termux.app.RunCommandService");
         i.setAction("com.termux.RUN_COMMAND");

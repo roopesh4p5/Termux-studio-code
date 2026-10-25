@@ -47,7 +47,7 @@ export const explorer = {
       { class: 'panel-actions' },
       iconButton('newFile', 'New File', () => newFile()),
       iconButton('newFolder', 'New Folder', () => newFolder()),
-      iconButton('refresh', 'Refresh', () => explorer.refresh()),
+      iconButton('refresh', 'Refresh', () => app.workspace.sync()),
       iconButton('collapse', 'Collapse All', () => {
         expanded = new Set();
         render();
@@ -67,6 +67,9 @@ export const explorer = {
     });
     bus.on('outline', renderOutline);
     bus.on('fs-changed', (dir) => explorer.refresh(dir));
+    bus.on('workspace', (ws) => {
+      if (!ws.root) explorer.unload();
+    });
     render();
     return this.el;
   },
@@ -82,16 +85,40 @@ export const explorer = {
     render();
   },
 
+  /** Forgets the closed project's tree. */
+  unload() {
+    root = null;
+    children.clear();
+    expanded = new Set();
+    selected = null;
+    render();
+    renderOutline();
+  },
+
   expandedList() {
     return [...expanded];
   },
 
-  /** Reloads one directory, or every loaded directory. */
+  /**
+   * Reloads one directory, or every expanded one (collapsed ones are dropped and re-read
+   * when opened). Re-renders only when a listing changed; returns whether one did.
+   */
   async refresh(dir) {
-    if (!root) return;
-    const dirs = dir && children.has(dir) ? [dir] : [...children.keys()].filter((d) => expanded.has(d));
+    if (!root) return false;
+    let dirs;
+    if (dir && children.has(dir)) {
+      dirs = [dir];
+    } else {
+      for (const d of [...children.keys()]) if (!expanded.has(d)) children.delete(d);
+      dirs = [...expanded];
+    }
+    const snapshot = () => dirs.map((d) => (children.get(d) ?? []).map((e) => (e.dir ? e.name + '/' : e.name)).join('|')).join('\n');
+    const before = snapshot();
     await Promise.all(dirs.map(loadDir));
-    render();
+    if (!root) return false;
+    const changed = snapshot() !== before;
+    if (changed) render();
+    return changed;
   },
 
   /** Expands to a path and selects it. */
