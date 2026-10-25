@@ -13,6 +13,9 @@ let lastResult = null;
 let showReplace = false;
 let showFilters = false;
 const collapsed = new Set();
+// Result lines rendered at once; "Show all" lifts it (thousands of rows are slow to lay out).
+const RENDER_LIMIT = 1000;
+let showAll = false;
 
 function toggle(label, title, key) {
   const b = h('button', {
@@ -113,7 +116,11 @@ export const searchView = {
       }
     });
     for (const i of [els.include, els.exclude]) i.addEventListener('keydown', (e) => e.key === 'Enter' && runSearch());
-    els.replace.addEventListener('input', render);
+    let replaceTimer = null;
+    els.replace.addEventListener('input', () => {
+      clearTimeout(replaceTimer);
+      replaceTimer = setTimeout(render, 150);
+    });
     bus.on('workspace', () => {
       lastResult = null;
       render();
@@ -169,6 +176,7 @@ async function runSearch() {
     if (els.query.value !== q) return;
     lastResult = res;
     lastResult.ms = Math.round(performance.now() - started);
+    showAll = false;
     render();
   } catch (e) {
     if (e.code === 'ECANCELED') return;
@@ -191,7 +199,13 @@ function render() {
     : 'No results found.';
   const replacing = showReplace && els.replace.value !== '' ? els.replace.value : null;
   const frag = document.createDocumentFragment();
+  let budget = showAll ? Infinity : RENDER_LIMIT;
+  let truncated = false;
   for (const f of res.files) {
+    if (budget <= 0) {
+      truncated = true;
+      break;
+    }
     const isCollapsed = collapsed.has(f.path);
     const dir = dirname('/' + f.path).slice(1);
     frag.append(
@@ -214,6 +228,11 @@ function render() {
     );
     if (isCollapsed) continue;
     for (const m of f.matches) {
+      if (budget <= 0) {
+        truncated = true;
+        break;
+      }
+      budget--;
       const pre = m.preview.slice(0, m.previewCol).trimStart();
       const hit = m.preview.slice(m.previewCol, m.previewCol + m.len);
       const post = m.preview.slice(m.previewCol + m.len);
@@ -232,6 +251,14 @@ function render() {
         }),
       );
     }
+  }
+  if (truncated) {
+    frag.append(
+      h('div', { class: 'muted pad' },
+        `Showing the first ${RENDER_LIMIT} results. `,
+        h('button', { class: 'btn small', onClick: () => { showAll = true; render(); } }, 'Show all'),
+      ),
+    );
   }
   els.results.append(frag);
 }

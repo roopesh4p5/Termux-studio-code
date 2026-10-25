@@ -13,6 +13,7 @@ let selected = null;
 let root = null;
 let els = {};
 let outlineOpen = true;
+let outlineStale = false;
 
 function sortEntries(list) {
   return list.sort((a, b) => (a.dir !== b.dir ? (a.dir ? -1 : 1) : a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true })));
@@ -58,14 +59,21 @@ export const explorer = {
       if (e.target === els.tree && root) dirMenu(root, x, y);
     });
     bus.on('git-status', render);
-    bus.on('dirty', render);
+    // Typing and switching tabs only touch one or two rows; don't rebuild the tree for them.
+    bus.on('dirty', (tab) => {
+      const row = tab?.path && rowFor(tab.path);
+      if (!row) return;
+      const dot = row.querySelector('.row-dirty');
+      if (tab.dirty && !dot) row.querySelector('.row-name').after(h('span', { class: 'row-dirty' }));
+      else if (!tab.dirty) dot?.remove();
+    });
     bus.on('active-tab', (tab) => {
-      if (tab?.path) {
-        selected = tab.path;
-        render();
-      }
+      if (tab?.path) select(tab.path);
     });
     bus.on('outline', renderOutline);
+    bus.on('view-shown', (view) => {
+      if (view === 'explorer' && outlineStale) renderOutline();
+    });
     bus.on('fs-changed', (dir) => explorer.refresh(dir));
     bus.on('workspace', (ws) => {
       if (!ws.root) explorer.unload();
@@ -170,6 +178,18 @@ function render() {
   tree.append(frag);
 }
 
+function rowFor(path) {
+  return els.tree.querySelector(`.tree-row[data-path="${CSS.escape(path)}"]`);
+}
+
+/** Moves the selection highlight without rebuilding the tree. */
+function select(path) {
+  if (selected === path) return;
+  selected = path;
+  els.tree.querySelector('.tree-row.selected')?.classList.remove('selected');
+  rowFor(path)?.classList.add('selected');
+}
+
 function renderDir(dir, depth, frag) {
   const list = children.get(dir);
   if (!list) return;
@@ -188,6 +208,7 @@ function renderDir(dir, depth, frag) {
         style: { paddingLeft: 6 + depth * 14 + 'px' },
         role: 'treeitem',
         title: rel,
+        dataset: { path },
         onClick: () => onRowClick(path, entry),
       },
       h('span', { class: 'chev', html: entry.dir ? icon(isOpen ? 'chevronDown' : 'chevronRight') : '' }),
@@ -197,8 +218,7 @@ function renderDir(dir, depth, frag) {
       git ? h('span', { class: 'row-git' }, git) : null,
     );
     onContext(row, (x, y) => {
-      selected = path;
-      render();
+      select(path);
       entry.dir ? dirMenu(path, x, y) : fileMenu(path, x, y);
     });
     frag.append(row);
@@ -216,16 +236,22 @@ async function onRowClick(path, entry) {
     }
     render();
   } else {
-    render();
+    select(path);
     await app.editor.openFile(path);
     app.layout.autoHideSidebar();
   }
 }
 
+/** Symbols are re-extracted only while the outline is on screen; otherwise when it next shows. */
 function renderOutline() {
   const list = els.outlineList;
   if (!list) return;
   els.outline.classList.toggle('collapsed', !outlineOpen);
+  if (outlineOpen && !app.layout?.isVisible('explorer')) {
+    outlineStale = true;
+    return;
+  }
+  outlineStale = false;
   list.innerHTML = '';
   if (!outlineOpen) return;
   const syms = app.editor.symbols();

@@ -24,8 +24,6 @@
     "@codemirror/lang-rust": "^6",
     "@codemirror/legacy-modes": "^6",
     "@lezer/highlight": "^1",
-    "isomorphic-git": "^1",
-    "buffer": "^6",
     "prettier": "^3",
     "marked": "^14",
     "dompurify": "^3",

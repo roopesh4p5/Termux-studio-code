@@ -58,13 +58,15 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         WebView.setWebContentsDebuggingEnabled(true);
+        installCrashLog();
+        AppLog.i("app", "start v" + Bridge.appVersion(this) + " on " + android.os.Build.MODEL
+                + " (Android " + android.os.Build.VERSION.RELEASE + ", SDK " + android.os.Build.VERSION.SDK_INT + ")");
 
         webView = new WebView(this);
         webView.setBackgroundColor(Color.parseColor("#1E1E1E"));
         WebSettings s = webView.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
-        s.setDatabaseEnabled(true);
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
         s.setTextZoom(100);
@@ -91,6 +93,15 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public boolean onRenderProcessGone(WebView view, android.webkit.RenderProcessGoneDetail detail) {
+                // Usually the WebView renderer running out of memory.
+                AppLog.e("webview", "renderer process gone (crashed=" + detail.didCrash()
+                        + ", priority=" + detail.rendererPriorityAtExit() + ")", null);
+                AppLog.flush();
+                return false;
+            }
+
+            @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
                 Uri u = req.getUrl();
                 if (HOST.equals(u.getHost())) return false;
@@ -107,6 +118,12 @@ public class MainActivity extends Activity {
             @Override
             public boolean onConsoleMessage(ConsoleMessage m) {
                 Log.d(TAG, "js: " + m.message() + " @" + m.sourceId() + ":" + m.lineNumber());
+                ConsoleMessage.MessageLevel level = m.messageLevel();
+                if (level != ConsoleMessage.MessageLevel.DEBUG && level != ConsoleMessage.MessageLevel.TIP) {
+                    String src = m.sourceId() == null ? "" : m.sourceId().replace(ORIGIN, "");
+                    AppLog.write(level == ConsoleMessage.MessageLevel.ERROR ? "E" : level == ConsoleMessage.MessageLevel.WARNING ? "W" : "I",
+                            "js", m.message() + (src.isEmpty() ? "" : " @" + src + ":" + m.lineNumber()));
+                }
                 return true;
             }
         });
@@ -199,6 +216,26 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
         evalJs("window.__onPermission && window.__onPermission(" + requestCode + ")");
+    }
+
+    /** Java crashes go to the app log before the default handler ends the process. */
+    private static void installCrashLog() {
+        Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        if (prev != null && prev.getClass().getName().startsWith(MainActivity.class.getName())) return;
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            AppLog.e("crash", "uncaught exception on " + t.getName(), e);
+            AppLog.flush();
+            if (prev != null) prev.uncaughtException(t, e);
+        });
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_RUNNING_LOW && level < TRIM_MEMORY_UI_HIDDEN || level >= TRIM_MEMORY_MODERATE) {
+            Runtime rt = Runtime.getRuntime();
+            AppLog.w("memory", "trim level " + level + ", java heap " + (rt.totalMemory() - rt.freeMemory()) / 1048576 + " MB used");
+        }
     }
 
     @Override

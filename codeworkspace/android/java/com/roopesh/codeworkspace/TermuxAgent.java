@@ -16,10 +16,16 @@ import java.nio.charset.StandardCharsets;
  * Client for the file agent (termux/agent.js) that runs inside Termux. Termux's private
  * storage (its home directory) is unreadable to this app, so fs.* and search.* operations on
  * those paths are forwarded to the agent, which answers in the bridge's own result format.
- * The agent is started on first use.
+ * Every git.* operation goes to the agent as well, which runs Termux's real git.
+ * The agent is started on first use, and replaced when an older version is still running.
  */
 class TermuxAgent {
     static final int PORT = 8772;
+    /** Must match VERSION in termux/agent.js. */
+    private static final int VERSION = 3;
+    private static final int TIMEOUT_MS = 120000;
+    /** Clone, fetch, pull and push can take long on slow connections. */
+    private static final int GIT_TIMEOUT_MS = 30 * 60 * 1000;
     private static final String[] PREFIXES = {"/data/data/com.termux/", "/data/user/0/com.termux/"};
 
     interface Starter {
@@ -31,6 +37,8 @@ class TermuxAgent {
     private final Starter starter;
     private final Object startLock = new Object();
     private volatile boolean used;
+    /** Set once a running agent answered our VERSION (an app update leaves the old one running). */
+    private volatile boolean verified;
 
     TermuxAgent(String token, Starter starter) {
         this.token = token;
@@ -45,12 +53,20 @@ class TermuxAgent {
 
     Object call(String op, JSONObject args) throws Exception {
         String body = new JSONObject().put("op", op).put("args", args).toString();
+        int timeout = op.startsWith("git.") ? GIT_TIMEOUT_MS : TIMEOUT_MS;
+        if (!verified) ensureStarted();
         String resp;
         try {
-            resp = post(body, 120000);
+            resp = post(body, timeout);
         } catch (ConnectException e) {
+            verified = false;
             ensureStarted();
-            resp = post(body, 120000);
+            resp = post(body, timeout);
+        } catch (IOException e) {
+            // A pooled keep-alive socket the agent had already closed: the request never reached
+            // it (Android does not retry POSTs itself), so sending it again is safe.
+            if (!String.valueOf(e.getMessage()).contains("unexpected end of stream")) throw e;
+            resp = post(body, timeout);
         }
         used = true;
         return unwrap(resp);
@@ -73,7 +89,10 @@ class TermuxAgent {
 
     private void ensureStarted() throws Exception {
         synchronized (startLock) {
-            if (ping()) return;
+            if (ping()) {
+                verified = true;
+                return;
+            }
             if ("permission".equals(starter.start())) {
                 throw new Bridge.BridgeException("EPERM",
                         "Allow Termux Studio Code to run commands in Termux (permission prompt), then try again.");
@@ -81,16 +100,20 @@ class TermuxAgent {
             // First start may install nodejs; give it time.
             for (int i = 0; i < 120; i++) {
                 Thread.sleep(i < 10 ? 200 : 500);
-                if (ping()) return;
+                if (ping()) {
+                    verified = true;
+                    return;
+                }
             }
             throw new Bridge.BridgeException("ENOAGENT",
                     "Could not reach the Termux file service. Check that Termux is running and nodejs is installed (pkg install nodejs).");
         }
     }
 
+    /** True when our version of the agent is running (an older one answers true or another number). */
     private boolean ping() {
         try {
-            return Boolean.TRUE.equals(unwrap(post("{\"op\":\"agent.ping\",\"args\":{}}", 2000)));
+            return Integer.valueOf(VERSION).equals(unwrap(post("{\"op\":\"agent.ping\",\"args\":{}}", 2000)));
         } catch (Exception e) {
             return false;
         }

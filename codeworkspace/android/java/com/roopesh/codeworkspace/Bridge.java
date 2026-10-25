@@ -32,12 +32,9 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -141,14 +138,22 @@ public class Bridge {
         });
     }
 
+    /** Bridge calls slower than this are written to the app log (see AppLog). */
+    private static final long SLOW_OP_MS = 1500;
+    /** Failures that mean Termux integration is broken, worth logging (unlike e.g. ENOENT). */
+    private static final List<String> LOGGED_CODES = Arrays.asList("EPERM", "ENOAGENT", "ENOGIT", "ENOTERMUX", "EIO");
+
     private String run(String op, String argsJson) {
+        long started = System.currentTimeMillis();
+        JSONObject args = null;
         try {
-            JSONObject args = argsJson == null || argsJson.isEmpty() ? new JSONObject() : new JSONObject(argsJson);
+            args = argsJson == null || argsJson.isEmpty() ? new JSONObject() : new JSONObject(argsJson);
             Object value = dispatch(op, args);
             JSONObject out = new JSONObject();
             out.put("ok", value == null ? JSONObject.NULL : value);
             return out.toString();
         } catch (BridgeException e) {
+            if (LOGGED_CODES.contains(e.code)) AppLog.w("bridge", op + " failed: " + e.code + " " + e.getMessage());
             return error(e.code, e.getMessage());
         } catch (ErrnoException e) {
             return error(OsConstants.errnoName(e.errno), e.getMessage());
@@ -158,7 +163,14 @@ public class Bridge {
             return error("EACCES", e.getMessage());
         } catch (Throwable e) {
             Log.w(MainActivity.TAG, "bridge op failed: " + op, e);
+            AppLog.e("bridge", op + " threw", e);
             return error("EIO", String.valueOf(e.getMessage()));
+        } finally {
+            long ms = System.currentTimeMillis() - started;
+            if (ms > SLOW_OP_MS) {
+                String what = op.equals("git.run") && args != null ? op + " " + args.optJSONArray("args") : op;
+                AppLog.w("perf", "slow bridge call " + what + ": " + ms + " ms");
+            }
         }
     }
 
@@ -179,6 +191,8 @@ public class Bridge {
             agent.cancelSearch();
             return null;
         }
+        // Git runs with Termux's git (see termux/agent.js), for projects anywhere.
+        if (op.startsWith("git.")) return agent.call(op, a);
         if (op.startsWith("fs.") || op.startsWith("search.")) {
             boolean termux = TermuxAgent.isTermuxPath(a.optString("path", a.optString("root", a.optString("from", ""))));
             if (a.has("to") && TermuxAgent.isTermuxPath(a.getString("to")) != termux)
@@ -204,27 +218,15 @@ public class Bridge {
 
             // ---- filesystem ----
             case "fs.list": return list(a.getString("path"));
-            case "fs.readdir": return readdir(a.getString("path"));
             case "fs.readText": return readText(a.getString("path"));
             case "fs.writeText": return writeBytes(a.getString("path"),
                     a.getString("text").getBytes(StandardCharsets.UTF_8));
-            case "fs.readB64": return Base64.encodeToString(readBytes(file(a.getString("path"))), Base64.NO_WRAP);
-            case "fs.writeB64": return writeBytes(a.getString("path"),
-                    Base64.decode(a.getString("data"), Base64.NO_WRAP));
-            case "fs.stat": return stat(a.getString("path"), false);
-            case "fs.lstat": return stat(a.getString("path"), true);
+            case "fs.stat": return stat(a.getString("path"));
             case "fs.exists": return new File(a.getString("path")).exists();
             case "fs.mkdir": mkdir(a.getString("path"), a.optBoolean("recursive")); return null;
-            case "fs.rmdir": rmdir(a.getString("path")); return null;
-            case "fs.unlink": Os.remove(a.getString("path")); return null;
             case "fs.delete": deleteRecursive(file(a.getString("path"))); return null;
             case "fs.rename": rename(a.getString("from"), a.getString("to"), a.optBoolean("overwrite")); return null;
             case "fs.copy": copy(file(a.getString("from")), new File(a.getString("to"))); return null;
-            case "fs.readlink": return Os.readlink(a.getString("path"));
-            case "fs.symlink": Os.symlink(a.getString("target"), a.getString("path")); return null;
-            case "fs.chmod":
-                try { Os.chmod(a.getString("path"), a.getInt("mode")); } catch (ErrnoException ignored) { }
-                return null;
 
             // ---- search ----
             case "fs.listFiles": return search.listFiles(a.getString("root"), stringList(a.optJSONArray("exclude")),
@@ -232,11 +234,7 @@ public class Bridge {
             case "search.text": return search.searchText(a);
             case "search.replace": return search.replaceText(a);
 
-            // ---- network (used by git) ----
-            case "http.request": return http(a);
-
             // ---- termux ----
-            case "termux.status": return termuxStatus();
             case "termux.run": return termuxRun(a.getString("cwd"), a.optString("command", ""));
             case "terminal.config": return terminalConfig();
             case "terminal.start": return terminalStart();
@@ -265,7 +263,17 @@ public class Bridge {
         o.put("externalRoot", Environment.getExternalStorageDirectory().getAbsolutePath());
         o.put("termuxInstalled", termuxInstalled());
         o.put("termuxHome", TERMUX_HOME);
+        o.put("version", appVersion(activity));
         return o;
+    }
+
+    /** versionName from the manifest: the single source of the version shown in the UI. */
+    static String appVersion(Context context) {
+        try {
+            return context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionName;
+        } catch (PackageManager.NameNotFoundException e) {
+            return "";
+        }
     }
 
     private boolean storageGranted() {
@@ -320,27 +328,25 @@ public class Bridge {
     private JSONArray list(String path) throws Exception {
         File dir = file(path);
         if (!dir.isDirectory()) throw new BridgeException("ENOTDIR", "Not a directory: " + path);
-        File[] children = dir.listFiles();
-        if (children == null) throw new BridgeException("EACCES", "Cannot read directory: " + path);
-        JSONArray out = new JSONArray();
-        for (File c : children) {
-            JSONObject o = new JSONObject();
-            o.put("name", c.getName());
-            o.put("dir", c.isDirectory());
-            o.put("size", c.length());
-            o.put("mtime", c.lastModified());
-            out.put(o);
-        }
-        return out;
-    }
-
-    private JSONArray readdir(String path) throws Exception {
-        File dir = file(path);
-        if (!dir.isDirectory()) throw new BridgeException("ENOTDIR", "Not a directory: " + path);
         String[] names = dir.list();
         if (names == null) throw new BridgeException("EACCES", "Cannot read directory: " + path);
         JSONArray out = new JSONArray();
-        for (String n : names) out.put(n);
+        for (String name : names) {
+            // One stat per entry (File.isDirectory/length/lastModified would be three, slow on FUSE).
+            StructStat st;
+            try {
+                st = Os.stat(path + "/" + name);
+            } catch (ErrnoException e) {
+                st = null; // e.g. a dangling symlink
+            }
+            boolean isDir = st != null && OsConstants.S_ISDIR(st.st_mode);
+            JSONObject o = new JSONObject();
+            o.put("name", name);
+            o.put("dir", isDir);
+            o.put("size", st == null || isDir ? 0 : st.st_size);
+            o.put("mtime", st == null ? 0 : st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000);
+            out.put(o);
+        }
         return out;
     }
 
@@ -382,8 +388,8 @@ public class Bridge {
         return o;
     }
 
-    private JSONObject stat(String path, boolean link) throws Exception {
-        StructStat st = link ? Os.lstat(path) : Os.stat(path);
+    private JSONObject stat(String path) throws Exception {
+        StructStat st = Os.stat(path);
         JSONObject o = new JSONObject();
         o.put("mode", st.st_mode);
         o.put("size", st.st_size);
@@ -412,14 +418,6 @@ public class Bridge {
             if (parent != null && !parent.exists()) throw new BridgeException("ENOENT", "No such directory: " + parent);
             throw new BridgeException("EACCES", "Cannot create directory: " + path);
         }
-    }
-
-    private void rmdir(String path) throws Exception {
-        File f = file(path);
-        if (!f.isDirectory()) throw new BridgeException("ENOTDIR", "Not a directory: " + path);
-        String[] names = f.list();
-        if (names != null && names.length > 0) throw new BridgeException("ENOTEMPTY", "Directory not empty: " + path);
-        if (!f.delete()) throw new BridgeException("EACCES", "Cannot remove directory: " + path);
     }
 
     private void rename(String from, String to, boolean overwrite) throws Exception {
@@ -455,58 +453,6 @@ public class Bridge {
         if (!f.delete()) throw new BridgeException("EACCES", "Cannot delete: " + f);
     }
 
-    // ------------------------------------------------------------------- network
-
-    private JSONObject http(JSONObject a) throws Exception {
-        HttpURLConnection conn = (HttpURLConnection) new URL(a.getString("url")).openConnection();
-        conn.setInstanceFollowRedirects(true);
-        conn.setConnectTimeout(20000);
-        conn.setReadTimeout(120000);
-        String method = a.optString("method", "GET");
-        conn.setRequestMethod(method);
-        JSONObject headers = a.optJSONObject("headers");
-        if (headers != null) {
-            for (java.util.Iterator<String> it = headers.keys(); it.hasNext(); ) {
-                String k = it.next();
-                conn.setRequestProperty(k, headers.getString(k));
-            }
-        }
-        String body = a.optString("body", "");
-        if (!body.isEmpty()) {
-            byte[] data = Base64.decode(body, Base64.NO_WRAP);
-            conn.setDoOutput(true);
-            conn.setFixedLengthStreamingMode(data.length);
-            try (OutputStream out = conn.getOutputStream()) {
-                out.write(data);
-            }
-        }
-        int status = conn.getResponseCode();
-        InputStream in = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
-        byte[] resp = new byte[0];
-        if (in != null) {
-            try (InputStream s = in) {
-                ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                byte[] buf = new byte[65536];
-                int n;
-                while ((n = s.read(buf)) > 0) bos.write(buf, 0, n);
-                resp = bos.toByteArray();
-            }
-        }
-        JSONObject o = new JSONObject();
-        o.put("url", conn.getURL().toString());
-        o.put("status", status);
-        o.put("statusText", conn.getResponseMessage() == null ? "" : conn.getResponseMessage());
-        JSONObject rh = new JSONObject();
-        for (Map.Entry<String, List<String>> e : conn.getHeaderFields().entrySet()) {
-            if (e.getKey() == null) continue;
-            rh.put(e.getKey().toLowerCase(), android.text.TextUtils.join(", ", e.getValue()));
-        }
-        o.put("headers", rh);
-        o.put("body", Base64.encodeToString(resp, Base64.NO_WRAP));
-        conn.disconnect();
-        return o;
-    }
-
     // -------------------------------------------------------------------- termux
 
     private boolean termuxInstalled() {
@@ -516,14 +462,6 @@ public class Bridge {
         } catch (PackageManager.NameNotFoundException e) {
             return false;
         }
-    }
-
-    private JSONObject termuxStatus() throws JSONException {
-        JSONObject o = new JSONObject();
-        o.put("installed", termuxInstalled());
-        o.put("permission", activity.checkSelfPermission("com.termux.permission.RUN_COMMAND")
-                == PackageManager.PERMISSION_GRANTED);
-        return o;
     }
 
     static final int TERMINAL_PORT = 8771;
@@ -579,7 +517,10 @@ public class Bridge {
         return runInBackground(script);
     }
 
-    static final String AGENT_PATTERN = "termux-studio/agent[.]js";
+    // Anchored to the node process: pkill -f matches whole command lines, and the bash -c script
+    // that runs pkill names agent.js too, so an unanchored pattern kills that script before it
+    // reaches "exec node" and the agent never starts.
+    static final String AGENT_PATTERN = "^node [^ ]*termux-studio/agent[.]js";
 
     /**
      * Files the app keeps in Termux: the file agent, the "code" command and the tmux config.

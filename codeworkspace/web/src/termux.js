@@ -50,7 +50,8 @@ function showSetupHelp(fallback) {
   });
 }
 
-async function packageScripts(root) {
+/** Script names from the project's package.json (also used by the terminal's Run Task). */
+export async function packageScripts(root) {
   try {
     const { text } = await fs.readText(join(root, 'package.json'));
     return Object.keys(JSON.parse(text).scripts ?? {});

@@ -192,7 +192,8 @@ export function toast(message, { type = 'info', timeout = 3500, action } = {}) {
 }
 
 export function errorToast(prefix, err) {
-  console.error(prefix, err);
+  // One string, so the app log (Documents/TermuxStudioCode/app.log) gets the code and stack.
+  console.error(`${prefix}: ${err?.code ? `[${err.code}] ` : ''}${err?.stack ?? err?.message ?? err}`);
   return toast(`${prefix}: ${err?.message ?? err}`, { type: 'error', timeout: 6000 });
 }
 

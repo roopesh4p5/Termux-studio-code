@@ -118,6 +118,18 @@ function render() {
     body.append(h('div', { class: 'empty-panel' }, h('p', {}, 'Open a folder to use source control.')));
     return;
   }
+  if (!ws.repoRoot && ws.gitError) {
+    body.append(
+      h(
+        'div',
+        { class: 'empty-panel' },
+        h('p', {}, 'Git runs in Termux and could not be reached:'),
+        h('p', { class: 'error-text small' }, ws.gitError),
+        h('button', { class: 'btn primary', onClick: () => app.workspace.detectRepo() }, 'Retry'),
+      ),
+    );
+    return;
+  }
   if (!ws.repoRoot) {
     body.append(
       h(
@@ -294,18 +306,12 @@ async function commit({ push: andPush = false, all = false } = {}) {
   if (andPush) await push();
 }
 
-function progressText(p) {
-  if (!p) return '';
-  const pct = p.total ? ` ${Math.round((p.loaded / p.total) * 100)}%` : '';
-  return `${p.phase}${pct}`;
-}
-
 async function pull() {
   if (!repo()) return;
   const author = await ensureAuthor();
   if (!author) return;
-  await withBusy('Pulling…', async (t) => {
-    await git.pull(repo(), author, (p) => t.update('Pulling… ' + progressText(p)));
+  await withBusy('Pulling…', async () => {
+    await git.pull(repo(), author);
     await afterRepoChange({ reload: true });
     toast('Pull complete', { type: 'success' });
   });
@@ -313,9 +319,8 @@ async function pull() {
 
 async function push() {
   if (!repo()) return;
-  await withBusy('Pushing…', async (t) => {
-    const res = await git.push(repo(), (p) => t.update('Pushing… ' + progressText(p)));
-    if (res && res.ok === false) throw new Error(res.error || 'Push rejected');
+  await withBusy('Pushing…', async () => {
+    await git.push(repo());
     await afterRepoChange();
     toast('Push complete', { type: 'success' });
   });
@@ -396,7 +401,7 @@ async function openDiff(c, isStaged) {
       newBlob = await git.readStaged(r, c.path);
     } else {
       oldBlob = (await git.readStaged(r, c.path)) ?? (await git.readCommitted(r, c.path));
-      newBlob = c.unstaged === 'D' ? null : new TextEncoder().encode((await fs.readText(abs)).text);
+      newBlob = c.unstaged === 'D' ? null : (await fs.readText(abs)).text;
     }
     tab.diff = {
       binary: git.isBinary(oldBlob) || git.isBinary(newBlob),
@@ -434,9 +439,8 @@ async function branchPicker() {
     provider: (q) => {
       const items = [
         { label: '+ Create new branch…', action: 'create' },
-        { label: '+ Create new branch from current and checkout', action: 'create', hidden: true },
         { label: '− Delete branch…', action: 'delete' },
-      ].filter((x) => !x.hidden);
+      ];
       const local = data.local
         .map((b) => ({ b, m: fuzzy(q, b) }))
         .filter((x) => x.m)
@@ -635,8 +639,8 @@ function moreMenu(anchor) {
 }
 
 async function fetchAll() {
-  await withBusy('Fetching…', async (t) => {
-    await git.fetchRemote(repo(), (p) => t.update('Fetching… ' + progressText(p)));
+  await withBusy('Fetching…', async () => {
+    await git.fetchRemote(repo());
     await afterRepoChange();
     toast('Fetch complete', { type: 'success' });
   });
@@ -666,10 +670,10 @@ async function clone() {
   const name = basename(url.replace(/\/+$/, '').replace(/\.git$/, '')) || 'repo';
   const dir = join(parent, name);
   if (await fs.exists(dir)) return toast(`${name} already exists in that folder`, { type: 'warn' });
-  await withBusy('Cloning…', async (t) => {
+  await withBusy(`Cloning ${name}…`, async () => {
     await fs.mkdir(dir, true);
     try {
-      await git.clone(dir, url, (p) => t.update(`Cloning ${name}… ${progressText(p)}`));
+      await git.clone(dir, url);
     } catch (e) {
       await fs.delete(dir).catch(() => {});
       throw e;

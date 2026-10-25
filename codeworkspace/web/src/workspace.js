@@ -15,6 +15,7 @@ export const workspace = {
   gitMap: {}, // workspace-relative path -> 'M' | 'A' | 'D' | 'U'
   gitDirs: new Set(), // workspace-relative dirs containing changes
   gitBusy: false,
+  gitError: null, // why git could not run (e.g. Termux unreachable, git not installed)
   fileList: null,
 
   async open(path) {
@@ -38,8 +39,8 @@ export const workspace = {
     bus.emit('workspace', this);
     await app.explorer.load(path, state.expanded ?? []);
     await app.editor.restore(state.editor);
-    this.gitSig = await this.gitSignature();
     await this.detectRepo();
+    this.gitSig = await this.gitSignature();
   },
 
   async close() {
@@ -81,8 +82,8 @@ export const workspace = {
       git.resetCache();
       this.fileList = null;
       await Promise.all([app.explorer.refresh(), app.editor.checkAllExternal()]);
-      this.gitSig = await this.gitSignature();
       await this.detectRepo();
+      this.gitSig = await this.gitSignature();
     } finally {
       this.syncing = false;
     }
@@ -93,8 +94,9 @@ export const workspace = {
   },
 
   /**
-   * Cheap periodic check: re-lists expanded folders, stats open files and a few files in
-   * .git, and only does the expensive git status when something actually changed.
+   * Cheap periodic check: re-lists expanded folders, stats the active file and a few files
+   * in .git, and only runs git status when something actually changed. Other open files
+   * are checked when they are activated.
    */
   async poll() {
     if (!this.root || this.syncing || this.polling || app.terminal?.typing()) return;
@@ -103,13 +105,13 @@ export const workspace = {
       const root = this.root;
       const treeChanged = await app.explorer.refresh();
       if (treeChanged) this.fileList = null;
-      await app.editor.checkAllExternal();
+      await app.editor.checkExternalChange(app.editor.activeTab());
       const sig = await this.gitSignature();
       if (root !== this.root) return;
       if (sig !== this.gitSig || treeChanged) {
-        this.gitSig = sig;
         git.resetCache();
         await this.detectRepo();
+        this.gitSig = await this.gitSignature();
       }
     } catch (e) {
       console.warn('workspace poll failed', e);
@@ -118,10 +120,14 @@ export const workspace = {
     }
   },
 
-  /** Changes whenever a repo appears/disappears, HEAD moves, the index is written or a fetch runs. */
+  /**
+   * Changes whenever a repo appears/disappears, HEAD moves, the index is written or a fetch
+   * runs. Only stats files (no git process), so it is cheap enough to poll.
+   */
   async gitSignature() {
-    const repo = this.root ? await git.findRoot(this.root) : null;
-    if (!repo) return '';
+    if (!this.root) return '';
+    const repo = this.repoRoot;
+    if (!repo) return (await fs.exists(join(this.root, '.git')).catch(() => false)) ? 'new' : '';
     const files = ['HEAD', 'index', 'FETCH_HEAD', 'logs/HEAD'];
     const times = await Promise.all(files.map((f) => fs.stat(join(repo, '.git', f)).then((s) => s.mtimeMs, () => 0)));
     return repo + ':' + times.join(',');
@@ -136,7 +142,14 @@ export const workspace = {
   },
 
   async detectRepo() {
-    this.repoRoot = this.root ? await git.findRoot(this.root) : null;
+    try {
+      this.repoRoot = this.root ? await git.findRoot(this.root) : null;
+      this.gitError = null;
+    } catch (e) {
+      // Termux (or its git) is unavailable; the Source Control panel shows why.
+      this.repoRoot = null;
+      this.gitError = e.message;
+    }
     await this.refreshGit();
   },
 
@@ -157,9 +170,9 @@ export const workspace = {
     this.gitBusy = true;
     bus.emit('git-busy', true);
     try {
-      const [changes, branch] = await Promise.all([git.status(this.repoRoot), git.currentBranch(this.repoRoot)]);
+      const { changes, branch, oid } = await git.statusFull(this.repoRoot);
       this.changes = changes;
-      this.branch = branch ?? (await git.headOid(this.repoRoot))?.slice(0, 7) ?? null;
+      this.branch = branch ?? oid?.slice(0, 7) ?? null;
       this.buildGitMap();
     } catch (e) {
       errorToast('Git status failed', e);

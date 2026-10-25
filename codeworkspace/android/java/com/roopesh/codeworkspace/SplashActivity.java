@@ -45,7 +45,7 @@ public class SplashActivity extends Activity {
         footer.setOrientation(LinearLayout.VERTICAL);
         footer.setGravity(Gravity.CENTER_HORIZONTAL);
         TextView dev = text("Developed by Roopesh", 17, "#E8E8E8", Typeface.SANS_SERIF, Typeface.BOLD);
-        TextView ver = text("Version 0.2.1", 13, "#6E7681", Typeface.SANS_SERIF, Typeface.NORMAL);
+        TextView ver = text("Version " + Bridge.appVersion(this), 13, "#6E7681", Typeface.SANS_SERIF, Typeface.NORMAL);
         ver.setPadding(0, dp(4), 0, 0);
         footer.addView(dev);
         footer.addView(ver);

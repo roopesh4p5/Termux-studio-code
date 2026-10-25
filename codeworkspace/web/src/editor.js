@@ -39,6 +39,9 @@ let dirtyTimer = null;
 let autoSaveTimer = null;
 const AUTO_SAVE_DELAY = 1000;
 let outlineTimer = null;
+// Open files whose editor state (document, undo history, syntax tree) stays in memory. Older
+// clean tabs keep only their path and cursor and are re-read from disk when activated.
+const MAX_LIVE_TABS = 8;
 
 // ------------------------------------------------------------------ setup
 
@@ -294,6 +297,8 @@ export async function activate(tab, { focus = false } = {}) {
     }
   }
   active = tab;
+  if (tab) tab.usedAt = Date.now();
+  releaseIdleTabs();
   if (tab?.kind === 'file') {
     view.setState(tab.state);
     if (justLoaded && tab.restorePos) {
@@ -312,6 +317,20 @@ export async function activate(tab, { focus = false } = {}) {
   bus.emit('active-tab', tab);
   bus.emit('outline');
   bus.emit('tabs-changed');
+}
+
+/** Unloads the least recently used clean tabs beyond MAX_LIVE_TABS (dirty tabs always stay). */
+function releaseIdleTabs() {
+  const idle = tabs.filter((t) => t.kind === 'file' && t.loaded && t !== active && !t.dirty);
+  const excess = idle.length - (MAX_LIVE_TABS - 1);
+  if (excess <= 0) return;
+  idle.sort((a, b) => (a.usedAt ?? 0) - (b.usedAt ?? 0));
+  for (const t of idle.slice(0, excess)) {
+    t.restorePos = t.state.selection.main.head;
+    t.state = null;
+    t.savedDoc = null;
+    t.loaded = false;
+  }
 }
 
 function showAlt() {
@@ -797,7 +816,7 @@ export function serialize() {
       .filter((t) => t.kind === 'file')
       .map((t) => {
         const st = currentState(t);
-        return { path: t.path, pos: st ? st.selection.main.head : 0, preview: t.preview };
+        return { path: t.path, pos: st ? st.selection.main.head : (t.restorePos ?? 0), preview: t.preview };
       }),
     active: active?.kind === 'file' ? active.path : null,
   };

@@ -4,17 +4,24 @@
 // ttyd protocol (subprotocol "tty"):
 //   client -> server: first message JSON {AuthToken, columns, rows}; then '0'+input, '1'+JSON{columns,rows}
 //   server -> client: '0'+output, '1'+window title, '2'+preferences JSON
-import { Terminal } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
-import { WebLinksAddon } from '@xterm/addon-web-links';
 import { app, bus } from './app.js';
-import { call, fs } from './native.js';
+import { call } from './native.js';
 import { h, iconButton, toast, onContext, contextMenu, quickPick } from './ui.js';
 import { icon } from './icons.js';
-import { basename, join } from './path.js';
+import { basename } from './path.js';
 import { settings, updateSettings } from './settings.js';
+import { packageScripts } from './termux.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// xterm.js (~280 KB) is loaded when the first terminal opens, not at app startup.
+let xtermModules = null;
+function loadXterm() {
+  // The packages are UMD/CommonJS: a dynamic import puts their exports under `default`.
+  const cjs = (m) => (m.default && !m.Terminal && !m.FitAddon && !m.WebLinksAddon ? m.default : m);
+  xtermModules ??= Promise.all([import('@xterm/xterm'), import('@xterm/addon-fit'), import('@xterm/addon-web-links')]).then((mods) => mods.map(cjs));
+  return xtermModules;
+}
 
 const THEME = {
   background: '#181818',
@@ -188,17 +195,20 @@ class Session {
     this.gone = false; // the server reported the tmux session no longer exists
     this.tmux = tmux ?? newTmuxName();
     this.reattach = !!tmux;
-    this.initTerm();
+    this.term = null; // created by start()
   }
 
-  initTerm() {
+  async initTerm() {
+    const [{ Terminal }, { FitAddon }, { WebLinksAddon }] = await loadXterm();
     this.term = new Terminal({
       // xterm needs a concrete font family, not a CSS variable.
       fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--mono').trim() || 'monospace',
       fontSize: Math.max(10, settings.fontSize - 1),
       lineHeight: 1.2,
       cursorBlink: true,
-      scrollback: 10000,
+      // Each scrollback line costs memory for every cell; 2000 lines per terminal is plenty
+      // (tmux keeps its own history too).
+      scrollback: 2000,
       allowProposedApi: true,
       theme: THEME,
     });
@@ -252,10 +262,20 @@ class Session {
     return true;
   }
 
-  async start() {
-    this.term.open(this.el);
-    this.fitNow();
-    await this.attach(this.reattach);
+  /**
+   * Creates the terminal and connects, once. `opened` settles as soon as the terminal is on
+   * screen (before the connection), so it can be focused early.
+   */
+  start() {
+    if (!this.started) {
+      this.opened = this.initTerm().then(() => {
+        if (this.disposed) return this.term.dispose(); // killed while xterm was loading
+        this.term.open(this.el);
+        this.fitNow();
+      });
+      this.started = this.opened.then(() => !this.disposed && this.attach(this.reattach));
+    }
+    return this.started;
   }
 
   /**
@@ -312,6 +332,7 @@ class Session {
 
   /** Right-click (mouse) or long-press (touch) menu; the selection is read before it can change. */
   showMenu(x, y) {
+    if (!this.term) return;
     const sel = this.term.getSelection();
     contextMenu(x, y, [
       {
@@ -372,9 +393,10 @@ class Session {
     this.reattachedAt = 0;
     this.lost = false;
     saveSessions();
-    this.term.dispose();
+    this.term?.dispose();
+    this.term = null;
+    this.started = null;
     this.el.innerHTML = '';
-    this.initTerm();
     this.exited = false;
     await this.start();
     this.term.focus();
@@ -395,7 +417,7 @@ class Session {
 
   fitNow() {
     try {
-      if (this.el.offsetParent) this.fit.fit();
+      if (this.term && this.el.offsetParent) this.fit.fit();
     } catch {
       /* not visible */
     }
@@ -410,7 +432,7 @@ class Session {
       /* ignore */
     }
     killTmux(this.tmux);
-    this.term.dispose();
+    this.term?.dispose();
     this.el.remove();
   }
 }
@@ -459,8 +481,8 @@ function restoreSessions() {
     s.el.hidden = true;
   }
   if (!sessions.length) return;
+  // Only the visible terminal reattaches now; the others (still running in tmux) when shown.
   activate(sessions[0]);
-  for (const s of sessions) s.start().then(() => s.fitNow());
   saveSessions();
 }
 
@@ -493,7 +515,7 @@ function renderTabs() {
       contextMenu(x, y, [
         { label: 'Kill Terminal', icon: 'trash', run: () => kill(s) },
         { label: 'Restart Terminal', icon: 'refresh', run: () => s.restart() },
-        { label: 'Clear', run: () => s.term.clear() },
+        { label: 'Clear', run: () => s.term?.clear() },
       ]),
     );
     list.append(tab);
@@ -504,10 +526,13 @@ function activate(s) {
   active = s;
   for (const x of sessions) x.el.hidden = x !== s;
   renderTabs();
-  requestAnimationFrame(() => {
-    s.fitNow();
-    s.term.focus();
-  });
+  s.start();
+  s.opened.then(() =>
+    requestAnimationFrame(() => {
+      s.fitNow();
+      s.term?.focus();
+    }),
+  );
 }
 
 function kill(s) {
@@ -551,15 +576,6 @@ function setupResizer(handle) {
   });
 }
 
-async function packageScripts(root) {
-  try {
-    const { text } = await fs.readText(join(root, 'package.json'));
-    return Object.keys(JSON.parse(text).scripts ?? {});
-  } catch {
-    return [];
-  }
-}
-
 export const terminal = {
   /** Builds the bottom panel; returns [resizeHandle, panel]. */
   build() {
@@ -588,6 +604,7 @@ export const terminal = {
     new ResizeObserver(() => active?.fitNow()).observe(els.body);
     bus.on('settings', (patch) => {
       if ('fontSize' in patch) for (const s of sessions) {
+        if (!s.term) continue;
         s.term.options.fontSize = Math.max(10, settings.fontSize - 1);
         s.fitNow();
       }

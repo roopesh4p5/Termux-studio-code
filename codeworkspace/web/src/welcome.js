@@ -1,5 +1,6 @@
 // Welcome page shown when no editor tab is open.
 import { app } from './app.js';
+import { appVersion } from './native.js';
 import { h } from './ui.js';
 import { icon } from './icons.js';
 import { basename, dirname } from './path.js';
@@ -62,7 +63,7 @@ export const welcome = {
       h(
         'div',
         { class: 'welcome-grid' },
-        h('section', {}, h('h3', {}, 'Start'), ...start, ws.root ? null : null),
+        h('section', {}, h('h3', {}, 'Start'), ...start),
         h('section', {}, h('h3', {}, 'Recent'), recentList),
         h(
           'section',
@@ -71,7 +72,7 @@ export const welcome = {
           ...SHORTCUTS.map(([l, k]) => h('div', { class: 'key-row' }, h('span', {}, l), h('kbd', {}, k))),
         ),
       ),
-      h('div', { class: 'welcome-footer muted' }, 'Termux Studio Code v0.3.2 · Developed by Roopesh'),
+      h('div', { class: 'welcome-footer muted' }, `Termux Studio Code v${appVersion()} · Developed by Roopesh`),
     );
   },
 };

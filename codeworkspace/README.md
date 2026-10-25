@@ -7,10 +7,12 @@ See `../android_tablet_code_workspace_prd.md` for the product spec.
 
 - `android/` — tiny native host (Java, no Gradle): splash screen, WebView, and a
   `window.Native` bridge (`Bridge.java`) for filesystem, project search (`SearchOps.java`),
-  HTTP (used by git), Termux `RUN_COMMAND` integration and private secret storage.
+  Termux `RUN_COMMAND` integration and private secret storage.
+- `termux/agent.js` — file agent running in Termux (Termux-home paths, and every git operation,
+  which runs with Termux's real `git`).
 - `web/src/` — the UI, bundled with esbuild into the APK assets:
-  CodeMirror 6 editor, isomorphic-git (Git runs in-app over the bridge),
-  Prettier (formatting, lazy-loaded), marked + DOMPurify (Markdown preview).
+  CodeMirror 6 editor, xterm.js terminal (lazy-loaded),
+  Prettier (formatting, lazy-loaded), marked + DOMPurify (Markdown preview, lazy-loaded).
 
 ## Build (on-device, in Termux)
 

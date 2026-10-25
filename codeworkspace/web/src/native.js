@@ -34,6 +34,19 @@ export function sync(op, args = {}) {
   return res.ok;
 }
 
+let version = null;
+/** The app's versionName (from the manifest), or '' in browser preview. */
+export function appVersion() {
+  if (version == null) {
+    try {
+      version = sync('platform').version ?? '';
+    } catch {
+      version = '';
+    }
+  }
+  return version;
+}
+
 export const fs = {
   list: (path) => call('fs.list', { path }),
   readText: (path) => call('fs.readText', { path }),

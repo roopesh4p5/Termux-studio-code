@@ -1,13 +1,15 @@
 // Unified diff viewer with old/new line numbers and intra-line change highlighting.
-import { structuredPatch, diffWordsWithSpace } from 'diff';
 import { app } from './app.js';
 import { h, esc } from './ui.js';
 import { icon } from './icons.js';
 
 const MAX_LINES = 6000;
 let fullFile = false;
+// The diff library loads with the first diff, not at app startup.
+let diffLib = null;
+let renderSeq = 0;
 
-function inlineDiff(oldLine, newLine) {
+function inlineDiff(oldLine, newLine, { diffWordsWithSpace }) {
   // Skip intra-line highlighting for very different or very long lines.
   if (oldLine.length + newLine.length > 2000) return [esc(oldLine), esc(newLine)];
   const parts = diffWordsWithSpace(oldLine, newLine);
@@ -40,8 +42,13 @@ function row(cls, oldNo, newNo, sign, html, onClick) {
 }
 
 export const diffView = {
-  render(container, tab) {
+  async render(container, tab) {
     container.classList.add('diff-view');
+    const seq = ++renderSeq;
+    diffLib ??= import('diff');
+    const lib = await diffLib;
+    // The editor may have shown something else in the container meanwhile.
+    if (seq !== renderSeq || !container.classList.contains('diff-view')) return;
     const d = tab.diff ?? {};
     const toolbar = h(
       'div',
@@ -65,7 +72,7 @@ export const diffView = {
     if (d.error) return container.append(h('div', { class: 'error-text pad' }, d.error));
     if (d.binary) return container.append(h('div', { class: 'muted pad' }, 'Binary file — no text diff available.'));
 
-    const patch = structuredPatch('a', 'b', d.oldText, d.newText, '', '', { context: fullFile ? 1e7 : 3 });
+    const patch = lib.structuredPatch('a', 'b', d.oldText, d.newText, '', '', { context: fullFile ? 1e7 : 3 });
     const body = h('div', { class: 'diff-body' });
     let added = 0;
     let removed = 0;
@@ -97,8 +104,16 @@ export const diffView = {
         const paired = rem.length === add.length && rem.length <= 50;
         const remHtml = [];
         const addHtml = [];
-        for (let k = 0; k < rem.length; k++) remHtml.push(paired ? inlineDiff(rem[k], add[k])[0] : esc(rem[k]));
-        for (let k = 0; k < add.length; k++) addHtml.push(paired ? inlineDiff(rem[k], add[k])[1] : esc(add[k]));
+        for (let k = 0; k < rem.length; k++) {
+          if (!paired) {
+            remHtml.push(esc(rem[k]));
+            continue;
+          }
+          const [a, b] = inlineDiff(rem[k], add[k], lib);
+          remHtml.push(a);
+          addHtml.push(b);
+        }
+        if (!paired) for (let k = 0; k < add.length; k++) addHtml.push(esc(add[k]));
         for (const html of remHtml) body.append(row('del', o++, null, '−', html)), shown++;
         for (const html of addHtml) {
           const line = n++;

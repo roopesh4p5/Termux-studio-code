@@ -1,6 +1,7 @@
 // Termux Studio Code file agent. Runs inside Termux (started by the app through RUN_COMMAND)
 // and serves the bridge's fs.* and search.* operations for paths under Termux's private
-// storage, which the app itself cannot read. Results match Bridge.java / SearchOps.java:
+// storage, which the app itself cannot read. It also runs every git.* operation (for all
+// projects) with Termux's real git. Results match Bridge.java / SearchOps.java:
 // {"ok": value} or {"err": message, "code": code}.
 //
 // Usage: node agent.js <port> <token>    — listens on 127.0.0.1, POST /<token> {op, args}
@@ -8,10 +9,14 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const { execFile } = require('child_process');
 
 const [port, token] = process.argv.slice(2);
+// Bumped whenever the protocol changes; the app restarts an agent that answers another version.
+const VERSION = 3;
 const MAX_TEXT_BYTES = 8 * 1024 * 1024;
 const MAX_SEARCH_BYTES = 2 * 1024 * 1024;
+const MAX_GIT_OUTPUT = 64 * 1024 * 1024;
 const MAX_PREVIEW = 240;
 const DEFAULT_EXCLUDE = ['.git', 'node_modules'];
 
@@ -64,12 +69,6 @@ function list(p) {
   });
 }
 
-function readdir(p) {
-  const st = fs.statSync(existing(p));
-  if (!st.isDirectory()) throw new OpError('ENOTDIR', 'Not a directory: ' + p);
-  return fs.readdirSync(p);
-}
-
 function readText(p) {
   const st = fs.statSync(existing(p));
   if (st.isDirectory()) throw new OpError('EISDIR', 'Is a directory: ' + p);
@@ -86,8 +85,8 @@ function writeBytes(p, data) {
   return { mtime: Math.floor(fs.statSync(p).mtimeMs) };
 }
 
-function stat(p, link) {
-  const s = link ? fs.lstatSync(p, { bigint: true }) : fs.statSync(p, { bigint: true });
+function stat(p) {
+  const s = fs.statSync(p, { bigint: true });
   return {
     mode: Number(s.mode),
     size: Number(s.size),
@@ -293,49 +292,66 @@ async function replaceText(a) {
   return { files: changed, count };
 }
 
+// ------------------------------------------------------------------------- git
+
+/**
+ * Runs Termux's git. Resolves {code, stdout, stderr} for any exit status: the app decides
+ * what a failure means (e.g. "git show" failing just means the file is absent there).
+ * safe.directory=* because projects on shared storage belong to another uid.
+ */
+function gitRun(a) {
+  const args = ['-c', 'safe.directory=*', '-c', 'core.quotepath=false'];
+  for (const c of a.config ?? []) args.push('-c', c);
+  args.push(...a.args);
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      'git',
+      args,
+      {
+        cwd: a.cwd,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', ...a.env },
+        maxBuffer: MAX_GIT_OUTPUT,
+        encoding: 'utf8',
+      },
+      (err, stdout, stderr) => {
+        if (err && typeof err.code !== 'number') {
+          if (err.code === 'ENOENT' && !fs.existsSync(a.cwd)) reject(new OpError('ENOENT', 'No such directory: ' + a.cwd));
+          else if (err.code === 'ENOENT') reject(new OpError('ENOGIT', 'git is not installed in Termux (pkg install git)'));
+          else reject(new OpError('EIO', err.message));
+          return;
+        }
+        resolve({ code: err ? err.code : 0, stdout, stderr });
+      },
+    );
+    child.stdin.end(a.input ?? '');
+  });
+}
+
 // -------------------------------------------------------------------- dispatch
 
 async function dispatch(op, a) {
   switch (op) {
     case 'fs.list': return list(a.path);
-    case 'fs.readdir': return readdir(a.path);
     case 'fs.readText': return readText(a.path);
     case 'fs.writeText': return writeBytes(a.path, Buffer.from(a.text, 'utf8'));
     case 'fs.readB64': return fs.readFileSync(existing(a.path)).toString('base64');
-    case 'fs.writeB64': return writeBytes(a.path, Buffer.from(a.data, 'base64'));
-    case 'fs.stat': return stat(a.path, false);
-    case 'fs.lstat': return stat(a.path, true);
+    case 'fs.stat': return stat(a.path);
     case 'fs.exists': return fs.existsSync(a.path);
     case 'fs.mkdir': return mkdir(a.path, a.recursive);
-    case 'fs.rmdir': {
-      if (!fs.statSync(existing(a.path)).isDirectory()) throw new OpError('ENOTDIR', 'Not a directory: ' + a.path);
-      fs.rmdirSync(a.path);
-      return null;
-    }
-    case 'fs.unlink': fs.unlinkSync(a.path); return null;
     case 'fs.delete': fs.rmSync(existing(a.path), { recursive: true }); return null;
     case 'fs.rename': return rename(a.from, a.to, a.overwrite);
     case 'fs.copy': return copy(a.from, a.to);
-    case 'fs.readlink': return fs.readlinkSync(a.path);
-    case 'fs.symlink': fs.symlinkSync(a.target, a.path); return null;
-    case 'fs.chmod':
-      try {
-        fs.chmodSync(a.path, a.mode);
-      } catch {
-        /* ignored, like the Java side */
-      }
-      return null;
     case 'fs.listFiles': return listFiles(a.root, a.exclude, a.max ?? 50000);
     case 'search.text': return searchText(a);
     case 'search.replace': return replaceText(a);
     case 'search.cancel': generation++; return null;
-    case 'agent.ping': return true;
+    case 'git.run': return gitRun(a);
+    case 'agent.ping': return VERSION;
     default: throw new OpError('ENOSYS', 'Unknown operation: ' + op);
   }
 }
 
-http
-  .createServer((req, res) => {
+const server = http.createServer((req, res) => {
     if (req.method !== 'POST' || req.url !== '/' + token) {
       res.writeHead(404).end();
       return;
@@ -355,5 +371,9 @@ http
       res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': body.length });
       res.end(body);
     });
-  })
-  .listen(Number(port), '127.0.0.1');
+  });
+// The app reuses connections between calls that can be many seconds apart (Node's default
+// 5 s keep-alive would close them under it).
+server.keepAliveTimeout = 10 * 60 * 1000;
+server.headersTimeout = server.keepAliveTimeout + 1000;
+server.listen(Number(port), '127.0.0.1');

@@ -1,6 +1,6 @@
 // Command registry, keyboard shortcuts, command palette, quick open, go to line/symbol, settings.
 import { app } from './app.js';
-import { call } from './native.js';
+import { call, appVersion } from './native.js';
 import { h, quickPick, fuzzy, hasOverlay, dialog, toast } from './ui.js';
 import { icon, fileBadge } from './icons.js';
 import { basename, dirname, join, relative } from './path.js';
@@ -427,10 +427,10 @@ function showAbout() {
       { class: 'about' },
       h('div', { class: 'welcome-logo' }, '</>'),
       h('h2', {}, 'Termux Studio Code'),
-      h('div', { class: 'muted' }, 'Version 0.3.2'),
+      h('div', { class: 'muted' }, `Version ${appVersion()}`),
       h('p', {}, 'A lightweight, tablet-first code workspace for browsing, editing, searching, formatting and managing Git repositories — with optional Termux integration.'),
       h('p', { class: 'about-dev' }, 'Developed by Roopesh'),
-      h('div', { class: 'muted small' }, 'Built with CodeMirror, isomorphic-git, Prettier and marked.'),
+      h('div', { class: 'muted small' }, 'Built with CodeMirror, xterm.js, Prettier and marked. Git and the terminal run in Termux.'),
     ),
   });
 }

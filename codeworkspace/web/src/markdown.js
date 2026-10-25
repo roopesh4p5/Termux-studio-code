@@ -1,20 +1,32 @@
 // Markdown preview (marked + DOMPurify). Relative images load through the /__fs/ asset route.
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
 import { app } from './app.js';
 import { call } from './native.js';
 import { h } from './ui.js';
 import { dirname, join } from './path.js';
 
-marked.setOptions({ gfm: true, breaks: false });
+// marked + DOMPurify load with the first preview, not at app startup.
+let libs = null;
+function loadLibs() {
+  libs ??= Promise.all([import('marked'), import('dompurify')]).then(([{ marked }, { default: DOMPurify }]) => {
+    marked.setOptions({ gfm: true, breaks: false });
+    return { marked, DOMPurify };
+  });
+  return libs;
+}
 
 function isExternal(href) {
   return /^[a-z][a-z0-9+.-]*:/i.test(href);
 }
 
+let renderSeq = 0;
+
 export const markdown = {
-  render(container, text, path) {
+  async render(container, text, path) {
     container.classList.add('md-preview');
+    const seq = ++renderSeq;
+    const { marked, DOMPurify } = await loadLibs();
+    // The editor may have shown something else in the container meanwhile.
+    if (seq !== renderSeq || !container.classList.contains('md-preview')) return;
     const html = DOMPurify.sanitize(marked.parse(text), { USE_PROFILES: { html: true } });
     const article = h('article', { class: 'markdown-body', html });
     const base = dirname(path);

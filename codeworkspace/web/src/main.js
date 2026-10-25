@@ -58,6 +58,11 @@ const layout = {
     sidebarVisible = visible;
     els.main.classList.toggle('sidebar-hidden', !visible);
     for (const b of els.activity.querySelectorAll('[data-view]')) b.classList.toggle('active', visible && b.dataset.view === currentView);
+    if (visible) bus.emit('view-shown', currentView);
+  },
+  /** Whether a side panel is on screen (panels skip work while hidden). */
+  isVisible(name) {
+    return sidebarVisible && currentView === name;
   },
   /** On narrow screens the sidebar overlays the editor; hide it after picking a file. */
   autoHideSidebar() {
@@ -191,13 +196,29 @@ function manageMenu(anchor) {
 
 let cursorInfo = null;
 let gitBusy = false;
+let statusFrame = 0;
 
 function statusItem(content, opts = {}) {
   return h(opts.onClick ? 'button' : 'span', { class: 'status-item', title: opts.title, onClick: opts.onClick }, ...[].concat(content));
 }
 
+function cursorText(c) {
+  return `Ln ${c.line}, Col ${c.col}${c.selected ? ` (${c.selected} selected)` : ''}${c.cursors > 1 ? ` · ${c.cursors} selections` : ''}`;
+}
+
+/** Rebuilds the status bar at most once per frame. */
+function scheduleStatus() {
+  if (!statusFrame) {
+    statusFrame = requestAnimationFrame(() => {
+      statusFrame = 0;
+      renderStatus();
+    });
+  }
+}
+
 function renderStatus() {
   const s = els.status;
+  els.cursorItem = null;
   s.innerHTML = '';
   s.classList.toggle('no-folder', !workspace.root);
   if (workspace.repoRoot) {
@@ -213,8 +234,9 @@ function renderStatus() {
   s.append(h('span', { class: 'spacer' }));
   if (cursorInfo) {
     const c = cursorInfo;
+    els.cursorItem = statusItem(cursorText(c), { title: 'Go to Line/Column', onClick: () => run('goToLine') });
     s.append(
-      statusItem(`Ln ${c.line}, Col ${c.col}${c.selected ? ` (${c.selected} selected)` : ''}${c.cursors > 1 ? ` · ${c.cursors} selections` : ''}`, { title: 'Go to Line/Column', onClick: () => run('goToLine') }),
+      els.cursorItem,
       statusItem(settings.insertSpaces ? `Spaces: ${settings.tabSize}` : `Tab Size: ${settings.tabSize}`, { title: 'Indentation', onClick: () => run('settings') }),
       statusItem('UTF-8'),
       statusItem(c.eol ?? 'LF'),
@@ -339,6 +361,7 @@ window.__onResume = async () => {
   await workspace.sync();
 };
 
+const POLL_MS = 10000;
 let persistTimer = null;
 function schedulePersist() {
   clearTimeout(persistTimer);
@@ -352,20 +375,26 @@ function boot() {
   registerCommands();
 
   bus.on('cursor', (c) => {
+    const prev = cursorInfo;
     cursorInfo = c;
-    renderStatus();
+    // While typing only the position changes: update its text instead of rebuilding the bar.
+    if (c && prev && els.cursorItem && !statusFrame && c.lang === prev.lang && c.eol === prev.eol) {
+      els.cursorItem.textContent = cursorText(c);
+    } else {
+      scheduleStatus();
+    }
   });
   bus.on('git-status', () => {
-    renderStatus();
+    scheduleStatus();
     renderScmBadge();
   });
   bus.on('git-busy', (b) => {
     gitBusy = b;
-    renderStatus();
+    scheduleStatus();
   });
   bus.on('workspace', () => {
     renderProject();
-    renderStatus();
+    scheduleStatus();
     editor.rerender();
     document.title = workspace.root ? `${workspace.name} — Termux Studio Code` : 'Termux Studio Code';
   });
@@ -376,12 +405,12 @@ function boot() {
   });
   bus.on('tabs-changed', schedulePersist);
   // Commands run in the terminal change files behind the app's back: sync once their output
-  // settles, and poll cheaply in case anything else (Termux, other apps) changes the project.
+  // settles (and on resume), and poll lightly in case anything else changes the project.
   bus.on('terminal-idle', () => workspace.sync());
   setInterval(() => {
     if (!document.hidden) workspace.poll();
-  }, 3000);
-  bus.on('settings', renderStatus);
+  }, POLL_MS);
+  bus.on('settings', scheduleStatus);
   bus.on('nav-state', (n) => {
     els.back.classList.toggle('dim', !n.back);
     els.forward.classList.toggle('dim', !n.forward);
@@ -408,7 +437,30 @@ function boot() {
   else startWorkspace();
 }
 
-window.addEventListener('error', (e) => toast(`Error: ${e.message}`, { type: 'error', timeout: 8000 }));
-window.addEventListener('unhandledrejection', (e) => toast(`Error: ${e.reason?.message ?? e.reason}`, { type: 'error', timeout: 8000 }));
+window.addEventListener('error', (e) => {
+  console.error(`Uncaught: ${e.error?.stack ?? e.message} @${e.filename}:${e.lineno}`);
+  toast(`Error: ${e.message}`, { type: 'error', timeout: 8000 });
+});
+window.addEventListener('unhandledrejection', (e) => {
+  console.error(`Unhandled rejection: ${e.reason?.code ? `[${e.reason.code}] ` : ''}${e.reason?.stack ?? e.reason}`);
+  toast(`Error: ${e.reason?.message ?? e.reason}`, { type: 'error', timeout: 8000 });
+});
+
+// UI freezes (main-thread tasks over 300 ms) go to the app log, to find what still lags.
+try {
+  new PerformanceObserver((list) => {
+    for (const t of list.getEntries()) {
+      if (t.duration > 300) console.warn(`Long task: ${Math.round(t.duration)} ms (${document.querySelector('.tab.active .tab-title')?.textContent ?? 'no file'})`);
+    }
+  }).observe({ type: 'longtask' });
+} catch {
+  /* not supported */
+}
+// JS heap size every 2 minutes, to spot memory growth.
+if (performance.memory) {
+  setInterval(() => {
+    if (!document.hidden) console.info(`Heap: ${Math.round(performance.memory.usedJSHeapSize / 1048576)} MB used, ${app.editor.getTabs().length} tabs`);
+  }, 120000);
+}
 
 boot();
