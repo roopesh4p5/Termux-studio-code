@@ -631,7 +631,7 @@ export const terminal = {
 
   /** Opens a new terminal in the project folder, optionally running a command. */
   async create(command) {
-    const cwd = app.workspace.root ?? '/storage/emulated/0';
+    const cwd = app.workspace.root ?? '/data/data/com.termux/files/home';
     setOpen(true);
     els.panel.hidden = false;
     els.handle.hidden = false;

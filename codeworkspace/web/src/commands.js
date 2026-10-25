@@ -427,7 +427,7 @@ function showAbout() {
       { class: 'about' },
       h('div', { class: 'welcome-logo' }, '</>'),
       h('h2', {}, 'Termux Studio Code'),
-      h('div', { class: 'muted' }, 'Version 0.3.0'),
+      h('div', { class: 'muted' }, 'Version 0.3.1'),
       h('p', {}, 'A lightweight, tablet-first code workspace for browsing, editing, searching, formatting and managing Git repositories — with optional Termux integration.'),
       h('p', { class: 'about-dev' }, 'Developed by Roopesh'),
       h('div', { class: 'muted small' }, 'Built with CodeMirror, isomorphic-git, Prettier and marked.'),
