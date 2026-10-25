@@ -629,9 +629,9 @@ export const terminal = {
     requestAnimationFrame(() => active?.fitNow());
   },
 
-  /** Opens a new terminal in the project folder, optionally running a command. */
+  /** Opens a new terminal in Termux home; tasks (with a command) run in the project folder. */
   async create(command) {
-    const cwd = app.workspace.root ?? '/data/data/com.termux/files/home';
+    const cwd = (command && app.workspace.root) || '/data/data/com.termux/files/home';
     setOpen(true);
     els.panel.hidden = false;
     els.handle.hidden = false;
